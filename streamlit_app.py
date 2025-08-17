@@ -1,7 +1,9 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
+
+# Usare Altair per i grafici (già incluso in Streamlit)
+import altair as alt
 
 st.set_page_config(page_title="Dashboard Validazione Trading", layout="wide")
 
@@ -28,15 +30,22 @@ if uploaded_file:
     st.subheader("Anteprima dati")
     st.write(data.head())
 
-    # Plot cumulative returns
+    # Plot cumulative returns con Altair
     if "returns" in data.columns:
         data["cumulative"] = (1 + data["returns"]).cumprod()
 
-        fig, ax = plt.subplots()
-        ax.plot(data["cumulative"], label="Cumulative Return")
-        ax.set_title("Equity Line")
-        ax.legend()
-        st.pyplot(fig)
+        chart = (
+            alt.Chart(data.reset_index())
+            .mark_line()
+            .encode(
+                x=alt.X("index", title="Periodo"),
+                y=alt.Y("cumulative", title="Cumulative Return"),
+                tooltip=["index", "cumulative"]
+            )
+            .properties(title="Equity Line", width=700, height=400)
+        )
+
+        st.altair_chart(chart, use_container_width=True)
     else:
         st.error("Il file deve contenere una colonna 'returns'.")
 
