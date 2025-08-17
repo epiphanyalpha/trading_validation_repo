@@ -1,2 +1,3 @@
 [server]
-enableWatchdogWatcher = false
+fileWatcherType = "none"
+
