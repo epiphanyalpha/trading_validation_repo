@@ -29,7 +29,7 @@ with st.sidebar:
     ann_factor = st.number_input("Fattore annualizzazione (Sharpe)", min_value=1, max_value=252, value=252, step=1)
     seed_demo = st.number_input("Seed dataset demo", min_value=0, value=42, step=1)
 
-    # 👉 new controls
+    # Demo dataset params
     n_strategies_demo = st.number_input("N° strategie (demo)", min_value=1, max_value=200, value=6, step=1)
     n_periods_demo = st.number_input("N° periodi (demo)", min_value=20, max_value=5000, value=250, step=10)
     force_zero_mean = st.checkbox("Forza media 0 (demo)", value=False)
@@ -45,7 +45,7 @@ def generate_demo_data(n_strategies=6, n_periods=250, seed=42, sigma=0.01, force
     """
     rng = np.random.default_rng(seed)
     data = {
-        f"strategy_{i+1}": rng.normal(0.0, sigma, size=n_periods)
+        f"strategy_{i}": rng.normal(0.0, sigma, size=n_periods)  # strategy_0 ... strategy_{n-1}
         for i in range(n_strategies)
     }
     df = pd.DataFrame(data, index=pd.date_range("2020-01-01", periods=n_periods, freq="D"))
@@ -72,11 +72,12 @@ def perf_series(df: pd.DataFrame, metric: str, ann: int):
 def cscv_pbo(data: pd.DataFrame, n_partitions: int, metric: str, rank_best_is_1: bool, ann: int = 252):
     assert n_partitions % 2 == 0 and n_partitions >= 2, "n_partitions dev'essere un intero pari ≥ 2"
     N = data.shape[1]  # numero strategie
+
     # split per tempo
     splits = np.array_split(data.index, n_partitions)
-    # tutte le combinazioni IS di taglia n/2
+
+    # tutte le combinazioni IS di taglia n/2 (OS = complementare)
     combs_IS = list(combinations(range(n_partitions), n_partitions // 2))
-    # OS è il complementare
     combs_OS = [sorted(set(range(n_partitions)) - set(c)) for c in combs_IS]
 
     logits = []
@@ -104,7 +105,7 @@ def cscv_pbo(data: pd.DataFrame, n_partitions: int, metric: str, rank_best_is_1:
         # ω in (0,1) usando N+1 per evitare estremi
         omega = float(r_paper) / float(N + 1)
         omega = min(max(omega, 1e-12), 1 - 1e-12)  # sicurezza numerica
-        lam = np.log(omega / (1.0 - omega))
+        lam = np.log(omega / (1.0 - omega))        # logit
 
         logits.append(lam)
         details.append({
@@ -123,7 +124,7 @@ def cscv_pbo(data: pd.DataFrame, n_partitions: int, metric: str, rank_best_is_1:
 
 
 # -------------------------------
-# File uploader
+# File uploader / demo data
 # -------------------------------
 uploaded = st.file_uploader("📂 Carica CSV (righe=periodi, colonne=strategie)", type=["csv"])
 
@@ -149,7 +150,7 @@ else:
 # -------------------------------
 st.subheader("Risultati CSCV / PBO")
 logits, pbo, df_details = cscv_pbo(
-    data, n_partitions=n_partitions, metric=metric, rank_best_is_1=rank_best_is_1, ann=ann_factor
+    data, n_partitions=int(n_partitions), metric=metric, rank_best_is_1=bool(rank_best_is_1), ann=int(ann_factor)
 )
 
 cols = st.columns(3)
@@ -170,27 +171,19 @@ hist = (
 )
 st.altair_chart(hist, use_container_width=True)
 
-# Tabella dettagli
+# -------------------------------
+# Dettagli combinazioni IS/OS
+# -------------------------------
 with st.expander("📄 Dettagli combinazioni IS/OS"):
-    st.dataframe(df_details)
+    st.dataframe(df_details, use_container_width=True)
+    csv = df_details.to_csv(index=False)
+    st.download_button("⬇️ Scarica dettagli CSV", data=csv, file_name="cscv_details.csv", mime="text/csv")
 
 # -------------------------------
-# Anteprima strategie
+# Anteprima strategie (CUMSUM → parte da 0)
 # -------------------------------
-plot_kind = st.radio(
-    "Tipo grafico anteprima",
-    options=["Equity (cumprod)", "Cumulative returns (cumsum)"],
-    index=0,
-    horizontal=True
-)
-
-st.subheader("Anteprima strategie")
-
-if plot_kind == "Equity (cumprod)":
-    to_plot = (1.0 + data).cumprod()
-else:
-    to_plot = data.cumsum()
-
+st.subheader("Anteprima strategie (cumulative returns, partenza 0)")
+to_plot = data.cumsum()  # <-- cumulative returns, starts at 0
 st.line_chart(to_plot)
 
 # -------------------------------
@@ -200,7 +193,7 @@ st.caption("📊 Statistiche rapide (dataset demo corrente)")
 stats = pd.DataFrame({
     "sample_mean": data.mean(),
     "sample_std": data.std(ddof=1),
-    "sharpe(ann)": data.apply(lambda c: sharpe_ratio(c.values, ann=ann_factor))
+    "sharpe(ann)": data.apply(lambda c: sharpe_ratio(c.values, ann=int(ann_factor)))
 })
 st.dataframe(stats.style.format({
     "sample_mean": "{:.6f}",
