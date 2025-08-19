@@ -21,7 +21,6 @@ Questa app esegue il test **CSCV / PBO** (Probability of Backtest Overfitting) d
 # -------------------------------
 # Sidebar controls
 # -------------------------------
-
 with st.sidebar:
     st.header("⚙️ Parametri")
     n_partitions = st.number_input("Numero di partizioni (pari)", min_value=2, max_value=24, value=8, step=2)
@@ -30,18 +29,19 @@ with st.sidebar:
     ann_factor = st.number_input("Fattore annualizzazione (Sharpe)", min_value=1, max_value=252, value=252, step=1)
     seed_demo = st.number_input("Seed dataset demo", min_value=0, value=42, step=1)
 
-    # 👉 new control
+    # 👉 new controls
     n_strategies_demo = st.number_input("N° strategie (demo)", min_value=1, max_value=200, value=6, step=1)
-    n_periods_demo = st.number_input("N° periodi (demo)", min_value=5, max_value=5000, value=10, step=5)
+    n_periods_demo = st.number_input("N° periodi (demo)", min_value=20, max_value=5000, value=250, step=10)
+    force_zero_mean = st.checkbox("Forza media 0 (demo)", value=False)
 
 
 # -------------------------------
 # Utilities
 # -------------------------------
-def generate_demo_data(n_strategies=6, n_periods=250, seed=42, sigma=0.01):
+def generate_demo_data(n_strategies=6, n_periods=250, seed=42, sigma=0.01, force_zero_mean=False):
     """
     Genera dati demo: serie di rendimenti i.i.d. ~ N(0, sigma^2).
-    Nessun drift, tutte le strategie hanno media 0.
+    Se force_zero_mean=True, ogni colonna viene de-meanata (media esattamente 0).
     """
     rng = np.random.default_rng(seed)
     data = {
@@ -49,21 +49,25 @@ def generate_demo_data(n_strategies=6, n_periods=250, seed=42, sigma=0.01):
         for i in range(n_strategies)
     }
     df = pd.DataFrame(data, index=pd.date_range("2020-01-01", periods=n_periods, freq="D"))
+    if force_zero_mean:
+        df = df - df.mean(axis=0)
     return df
 
 
 def sharpe_ratio(x: np.ndarray, ann=252, eps=1e-12):
     mu = np.nanmean(x)
     sd = np.nanstd(x, ddof=1)
-    if sd < eps: 
+    if sd < eps:
         return -np.inf  # penalizza serie piatte
     return (mu / sd) * np.sqrt(ann)
+
 
 def perf_series(df: pd.DataFrame, metric: str, ann: int):
     if metric == "Sharpe":
         return df.apply(lambda col: sharpe_ratio(col.values, ann=ann), axis=0)
     else:
         return df.mean(axis=0)
+
 
 def cscv_pbo(data: pd.DataFrame, n_partitions: int, metric: str, rank_best_is_1: bool, ann: int = 252):
     assert n_partitions % 2 == 0 and n_partitions >= 2, "n_partitions dev'essere un intero pari ≥ 2"
@@ -99,8 +103,7 @@ def cscv_pbo(data: pd.DataFrame, n_partitions: int, metric: str, rank_best_is_1:
 
         # ω in (0,1) usando N+1 per evitare estremi
         omega = float(r_paper) / float(N + 1)
-        # sicurezza numerica
-        omega = min(max(omega, 1e-12), 1 - 1e-12)
+        omega = min(max(omega, 1e-12), 1 - 1e-12)  # sicurezza numerica
         lam = np.log(omega / (1.0 - omega))
 
         logits.append(lam)
@@ -118,6 +121,7 @@ def cscv_pbo(data: pd.DataFrame, n_partitions: int, metric: str, rank_best_is_1:
     pbo = float((logits < 0).mean())
     return logits, pbo, pd.DataFrame(details)
 
+
 # -------------------------------
 # File uploader
 # -------------------------------
@@ -125,7 +129,6 @@ uploaded = st.file_uploader("📂 Carica CSV (righe=periodi, colonne=strategie)"
 
 if uploaded is not None:
     data = pd.read_csv(uploaded, index_col=0)
-    # prova a fare parse delle date, altrimenti lascia l'indice così com'è
     try:
         data.index = pd.to_datetime(data.index)
     except Exception:
@@ -134,10 +137,11 @@ if uploaded is not None:
 else:
     st.info("ℹ️ Nessun file caricato: uso dataset demo")
     data = generate_demo_data(
-    n_strategies=int(n_strategies_demo),
-    n_periods=int(n_periods_demo),
-    seed=int(seed_demo)
-)
+        n_strategies=int(n_strategies_demo),
+        n_periods=int(n_periods_demo),
+        seed=int(seed_demo),
+        force_zero_mean=bool(force_zero_mean)
+    )
 
 
 # -------------------------------
@@ -173,9 +177,33 @@ with st.expander("📄 Dettagli combinazioni IS/OS"):
 # -------------------------------
 # Anteprima strategie
 # -------------------------------
-st.subheader("Anteprima strategie (equity line cumulativa)")
-st.line_chart((1 + data).cumprod())
+plot_kind = st.radio(
+    "Tipo grafico anteprima",
+    options=["Equity (cumprod)", "Cumulative returns (cumsum)"],
+    index=0,
+    horizontal=True
+)
 
+st.subheader("Anteprima strategie")
 
+if plot_kind == "Equity (cumprod)":
+    to_plot = (1.0 + data).cumprod()
+else:
+    to_plot = data.cumsum()
 
+st.line_chart(to_plot)
 
+# -------------------------------
+# Quick stats
+# -------------------------------
+st.caption("📊 Statistiche rapide (dataset demo corrente)")
+stats = pd.DataFrame({
+    "sample_mean": data.mean(),
+    "sample_std": data.std(ddof=1),
+    "sharpe(ann)": data.apply(lambda c: sharpe_ratio(c.values, ann=ann_factor))
+})
+st.dataframe(stats.style.format({
+    "sample_mean": "{:.6f}",
+    "sample_std": "{:.6f}",
+    "sharpe(ann)": "{:.3f}"
+}))
