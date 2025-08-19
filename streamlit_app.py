@@ -1,103 +1,160 @@
+# app.py
 import streamlit as st
 import pandas as pd
 import numpy as np
 import altair as alt
+from itertools import combinations
 
 st.set_page_config(page_title="Dashboard Validazione Trading", layout="wide")
-
 st.title("📊 Dashboard Validazione Trading")
 
-st.markdown(
-    """
-    Questa app mostra il test **CSCV / PBO** (Probability of Backtest Overfitting) 
-    di López de Prado per valutare se una strategia è overfittata.
-    """
-)
+st.markdown("""
+Questa app esegue il test **CSCV / PBO** (Probability of Backtest Overfitting) di López de Prado.
+- Divide la serie temporale in *n* partizioni uguali.
+- Genera **tutte** le combinazioni IS/OS con IS = OS = n/2.
+- Seleziona la strategia **migliore in-sample**, ne valuta il **rank out-of-sample** e calcola:
+\\[
+\\omega = \\frac{r}{N+1},\\qquad \\lambda = \\log\\frac{\\omega}{1-\\omega},\\qquad \\text{PBO} = \\Pr[\\lambda < 0].
+\\]
+""")
 
 # -------------------------------
-# Utility functions
+# Sidebar controls
 # -------------------------------
-def generate_demo_data(n_strategies=5, n_periods=200, seed=42):
-    """Genera un dataset demo di strategie con rendimenti casuali."""
+with st.sidebar:
+    st.header("⚙️ Parametri")
+    n_partitions = st.number_input("Numero di partizioni (pari)", min_value=2, max_value=24, value=8, step=2)
+    metric = st.selectbox("Metrica performance", ["Sharpe", "Mean return"])
+    rank_best_is_1 = st.checkbox("Usa convenzione intuitiva: 1 = best", value=True)
+    ann_factor = st.number_input("Fattore annualizzazione (Sharpe)", min_value=1, max_value=252, value=252, step=1)
+    seed_demo = st.number_input("Seed dataset demo", min_value=0, value=42, step=1)
+
+# -------------------------------
+# Utilities
+# -------------------------------
+def generate_demo_data(n_strategies=6, n_periods=500, seed=42):
     np.random.seed(seed)
-    data = pd.DataFrame(
-        {
-            f"strategy_{i}": np.random.normal(0.001 * i, 0.02, n_periods)
-            for i in range(1, n_strategies + 1)
-        }
-    )
+    # strat i ha leggermente più drift
+    data = pd.DataFrame({f"strategy_{i}": np.random.normal(0.0005 * i, 0.01, n_periods)
+                         for i in range(1, n_strategies + 1)})
     data.index = pd.date_range("2020-01-01", periods=n_periods, freq="D")
     return data
 
-def cscv_pbo(data, n_partitions=8):
-    """
-    Implementazione semplificata del CSCV test.
-    Input: dataframe con colonne = strategie, righe = periodi
-    """
-    n_strat = data.shape[1]
-    partitions = np.array_split(data, n_partitions)
-    log_ratios = []
+def sharpe_ratio(x: np.ndarray, ann=252, eps=1e-12):
+    mu = np.nanmean(x)
+    sd = np.nanstd(x, ddof=1)
+    if sd < eps: 
+        return -np.inf  # penalizza serie piatte
+    return (mu / sd) * np.sqrt(ann)
 
-    for i in range(n_partitions):
-        oos = partitions[i]
-        is_ = pd.concat([p for j, p in enumerate(partitions) if j != i])
+def perf_series(df: pd.DataFrame, metric: str, ann: int):
+    if metric == "Sharpe":
+        return df.apply(lambda col: sharpe_ratio(col.values, ann=ann), axis=0)
+    else:
+        return df.mean(axis=0)
 
-        # performance medie
-        is_perf = is_.mean()
-        oos_perf = oos.mean()
+def cscv_pbo(data: pd.DataFrame, n_partitions: int, metric: str, rank_best_is_1: bool, ann: int = 252):
+    assert n_partitions % 2 == 0 and n_partitions >= 2, "n_partitions dev'essere un intero pari ≥ 2"
+    N = data.shape[1]  # numero strategie
+    # split per tempo
+    splits = np.array_split(data.index, n_partitions)
+    # tutte le combinazioni IS di taglia n/2
+    combs_IS = list(combinations(range(n_partitions), n_partitions // 2))
+    # OS è il complementare
+    combs_OS = [sorted(set(range(n_partitions)) - set(c)) for c in combs_IS]
 
-        # best IS strategy
-        best_strat = is_perf.idxmax()
+    logits = []
+    details = []
 
-        # rank of that strategy OOS
-        ranks = oos_perf.rank()
-        rank_best = ranks[best_strat]
+    for IS_idx, OS_idx in zip(combs_IS, combs_OS):
+        IS_rows = np.concatenate([splits[i] for i in IS_idx])
+        OS_rows = np.concatenate([splits[i] for i in OS_idx])
 
-        log_ratio = np.log(rank_best / (n_strat - rank_best + 1))
-        log_ratios.append(log_ratio)
+        df_is = data.loc[IS_rows]
+        df_os = data.loc[OS_rows]
 
-    log_ratios = np.array(log_ratios)
-    pbo = (log_ratios < 0).mean()
-    return log_ratios, pbo
+        # punteggi per strategia
+        s_is = perf_series(df_is, metric, ann)
+        winner = s_is.idxmax()
+
+        s_os = perf_series(df_os, metric, ann)
+
+        # rank OOS (1 = best, N = worst) con pandas.rank(ascending=False)
+        r_bestfirst = s_os.rank(ascending=False, method="average")[winner]
+
+        # converti alla convenzione del paper (1 = worst, N = best)
+        r_paper = N - r_bestfirst + 1 if rank_best_is_1 else r_bestfirst
+
+        # ω in (0,1) usando N+1 per evitare estremi
+        omega = float(r_paper) / float(N + 1)
+        # sicurezza numerica
+        omega = min(max(omega, 1e-12), 1 - 1e-12)
+        lam = np.log(omega / (1.0 - omega))
+
+        logits.append(lam)
+        details.append({
+            "IS_partitions": IS_idx,
+            "OS_partitions": OS_idx,
+            "winner": winner,
+            "r_bestfirst": float(r_bestfirst),
+            "r_paper": float(r_paper),
+            "omega": float(omega),
+            "lambda": float(lam),
+        })
+
+    logits = np.array(logits, dtype=float)
+    pbo = float((logits < 0).mean())
+    return logits, pbo, pd.DataFrame(details)
 
 # -------------------------------
 # File uploader
 # -------------------------------
-uploaded_file = st.file_uploader("📂 Carica un file CSV (colonne = strategie, righe = rendimenti)", type=["csv"])
+uploaded = st.file_uploader("📂 Carica CSV (righe=periodi, colonne=strategie)", type=["csv"])
 
-if uploaded_file:
-    data = pd.read_csv(uploaded_file, index_col=0, parse_dates=True)
-    st.success("✅ File caricato con successo")
+if uploaded is not None:
+    data = pd.read_csv(uploaded, index_col=0)
+    # prova a fare parse delle date, altrimenti lascia l'indice così com'è
+    try:
+        data.index = pd.to_datetime(data.index)
+    except Exception:
+        pass
+    st.success("✅ File caricato")
 else:
-    st.warning("⚠️ Nessun file caricato: uso dataset demo")
-    data = generate_demo_data()
+    st.info("ℹ️ Nessun file caricato: uso dataset demo")
+    data = generate_demo_data(seed=seed_demo)
 
 # -------------------------------
-# Run CSCV / PBO test
+# Run CSCV / PBO
 # -------------------------------
 st.subheader("Risultati CSCV / PBO")
+logits, pbo, df_details = cscv_pbo(
+    data, n_partitions=n_partitions, metric=metric, rank_best_is_1=rank_best_is_1, ann=ann_factor
+)
 
-log_ratios, pbo = cscv_pbo(data)
+cols = st.columns(3)
+cols[0].metric("PBO (Prob. overfitting)", f"{pbo:.2%}")
+cols[1].metric("N° combinazioni", f"{len(logits)}")
+cols[2].metric("λ mediano", f"{np.median(logits):.3f}")
 
-st.write(f"**PBO (Probabilità di Overfitting):** {pbo:.2%}")
-
-# Distribuzione log-ratios
-chart_data = pd.DataFrame({"log_ratio": log_ratios})
-
+# Distribuzione λ
+chart_data = pd.DataFrame({"lambda": logits})
 hist = (
     alt.Chart(chart_data)
     .mark_bar()
     .encode(
-        alt.X("log_ratio", bin=alt.Bin(maxbins=20), title="Log(Rank ratio)"),
-        y="count()"
+        alt.X("lambda", bin=alt.Bin(maxbins=30), title="λ = logit(ω)"),
+        y=alt.Y("count()", title="Frequenza")
     )
-    .properties(title="Distribuzione log-ratios (CSCV)", width=600, height=400)
+    .properties(title="Distribuzione di λ (CSCV)", width=700, height=400)
 )
-
 st.altair_chart(hist, use_container_width=True)
 
+# Tabella dettagli
+with st.expander("📄 Dettagli combinazioni IS/OS"):
+    st.dataframe(df_details)
+
 # -------------------------------
-# Preview strategies
+# Anteprima strategie
 # -------------------------------
-st.subheader("Anteprima strategie")
+st.subheader("Anteprima strategie (equity line cumulativa)")
 st.line_chart((1 + data).cumprod())
