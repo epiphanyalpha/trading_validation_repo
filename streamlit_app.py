@@ -38,13 +38,19 @@ with st.sidebar:
 # -------------------------------
 # Utilities
 # -------------------------------
-def generate_demo_data(n_strategies=6, n_periods=500, seed=42):
-    np.random.seed(seed)
-    # strat i ha leggermente più drift
-    data = pd.DataFrame({f"strategy_{i}": np.random.normal(0.0005 * i, 0.01, n_periods)
-                         for i in range(1, n_strategies + 1)})
-    data.index = pd.date_range("2020-01-01", periods=n_periods, freq="D")
-    return data
+def generate_demo_data(n_strategies=6, n_periods=250, seed=42, sigma=0.01):
+    """
+    Genera dati demo: serie di rendimenti i.i.d. ~ N(0, sigma^2).
+    Nessun drift, tutte le strategie hanno media 0.
+    """
+    rng = np.random.default_rng(seed)
+    data = {
+        f"strategy_{i+1}": rng.normal(0.0, sigma, size=n_periods)
+        for i in range(n_strategies)
+    }
+    df = pd.DataFrame(data, index=pd.date_range("2020-01-01", periods=n_periods, freq="D"))
+    return df
+
 
 def sharpe_ratio(x: np.ndarray, ann=252, eps=1e-12):
     mu = np.nanmean(x)
@@ -169,6 +175,7 @@ with st.expander("📄 Dettagli combinazioni IS/OS"):
 # -------------------------------
 st.subheader("Anteprima strategie (equity line cumulativa)")
 st.line_chart((1 + data).cumprod())
+
 
 
 
