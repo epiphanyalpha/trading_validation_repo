@@ -2,114 +2,102 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import altair as alt
-import matplotlib.pyplot as plt
-from itertools import product
 
 st.set_page_config(page_title="Dashboard Validazione Trading", layout="wide")
 
-st.title("📊 Dashboard Validazione Trading — PBO Test")
+st.title("📊 Dashboard Validazione Trading")
 
 st.markdown(
     """
-    Questa app mostra i risultati del **Probability of Backtest Overfitting (PBO)** 
-    come descritto da López de Prado.
-
-    - Input atteso: un CSV con `date` come indice e ogni colonna = P&L di una strategia.
-    - Se non carichi un file, viene generato un dataset demo (12 strategie sintetiche).
+    Questa app mostra il test **CSCV / PBO** (Probability of Backtest Overfitting) 
+    di López de Prado per valutare se una strategia è overfittata.
     """
 )
 
-# === Load data ===
-uploaded_file = st.file_uploader("📂 Carica un file CSV (colonne = strategie)", type=["csv"])
-
-if uploaded_file is not None:
-    data = pd.read_csv(uploaded_file, index_col=0, parse_dates=True)
-    st.success("✅ Dati caricati dal CSV!")
-else:
-    # DEMO mode: create synthetic data
-    np.random.seed(42)
-    n_strategies = 12
-    n_days = 800
-    dates = pd.date_range("2020-01-01", periods=n_days, freq="B")
+# -------------------------------
+# Utility functions
+# -------------------------------
+def generate_demo_data(n_strategies=5, n_periods=200, seed=42):
+    """Genera un dataset demo di strategie con rendimenti casuali."""
+    np.random.seed(seed)
     data = pd.DataFrame(
-        np.random.randn(n_days, n_strategies).cumsum(axis=0),
-        index=dates,
-        columns=[f"Strategy_{i}" for i in range(n_strategies)]
+        {
+            f"strategy_{i}": np.random.normal(0.001 * i, 0.02, n_periods)
+            for i in range(1, n_strategies + 1)
+        }
     )
-    st.info("ℹ️ Nessun file caricato: uso dati demo sintetici.")
+    data.index = pd.date_range("2020-01-01", periods=n_periods, freq="D")
+    return data
 
-st.subheader("📈 Equity Curves (tutte le strategie)")
-chart_data = data.reset_index().melt(id_vars="index", var_name="Strategy", value_name="PnL")
-chart = (
-    alt.Chart(chart_data)
-    .mark_line(opacity=0.7)
-    .encode(
-        x="index:T",
-        y="PnL:Q",
-        color="Strategy:N",
-        tooltip=["index:T", "Strategy", "PnL"]
-    )
-    .properties(width=800, height=400)
-)
-st.altair_chart(chart, use_container_width=True)
+def cscv_pbo(data, n_partitions=8):
+    """
+    Implementazione semplificata del CSCV test.
+    Input: dataframe con colonne = strategie, righe = periodi
+    """
+    n_strat = data.shape[1]
+    partitions = np.array_split(data, n_partitions)
+    log_ratios = []
 
+    for i in range(n_partitions):
+        oos = partitions[i]
+        is_ = pd.concat([p for j, p in enumerate(partitions) if j != i])
 
-# === PBO Implementation ===
-def pbo_test(df, n_partitions=8):
-    """Implements López de Prado's Probability of Backtest Overfitting test."""
-    n_strats = df.shape[1]
-    n_obs = df.shape[0]
+        # performance medie
+        is_perf = is_.mean()
+        oos_perf = oos.mean()
 
-    # Split data into n_partitions
-    partition_size = n_obs // n_partitions
-    partitions = [df.iloc[i*partition_size:(i+1)*partition_size] for i in range(n_partitions)]
+        # best IS strategy
+        best_strat = is_perf.idxmax()
 
-    logit_values = []
+        # rank of that strategy OOS
+        ranks = oos_perf.rank()
+        rank_best = ranks[best_strat]
 
-    for train_idx in product([0,1], repeat=n_partitions):
-        if sum(train_idx) == 0 or sum(train_idx) == n_partitions:
-            continue  # skip all-train or all-test
+        log_ratio = np.log(rank_best / (n_strat - rank_best + 1))
+        log_ratios.append(log_ratio)
 
-        train_parts = [p for i,p in enumerate(partitions) if train_idx[i]==1]
-        test_parts  = [p for i,p in enumerate(partitions) if train_idx[i]==0]
+    log_ratios = np.array(log_ratios)
+    pbo = (log_ratios < 0).mean()
+    return log_ratios, pbo
 
-        train = pd.concat(train_parts)
-        test  = pd.concat(test_parts)
+# -------------------------------
+# File uploader
+# -------------------------------
+uploaded_file = st.file_uploader("📂 Carica un file CSV (colonne = strategie, righe = rendimenti)", type=["csv"])
 
-        # Sharpe ratios
-        sr_train = train.mean()/train.std()
-        sr_test = test.mean()/test.std()
-
-        # Best strategy in training
-        best_idx = sr_train.idxmax()
-
-        # Relative ranking of that strategy in test
-        rank_test = sr_test.rank(ascending=True)[best_idx]
-        u = (rank_test-1)/(n_strats-1)  # percentile in [0,1]
-
-        if u in [0,1]:
-            continue
-        logit = np.log(u/(1-u))
-        logit_values.append(logit)
-
-    return np.array(logit_values)
-
-
-# Run PBO
-logits = pbo_test(data)
-
-if len(logits) > 0:
-    pbo = np.mean(logits <= 0)  # probability that best in-sample is not best out-of-sample
-    st.subheader("📊 Risultati PBO")
-    st.write(f"**Probability of Backtest Overfitting (PBO): {pbo:.2%}**")
-
-    fig, ax = plt.subplots(figsize=(6,4))
-    ax.hist(logits, bins=30, color="skyblue", edgecolor="black")
-    ax.axvline(0, color="red", linestyle="--", label="logit=0")
-    ax.set_title("Distribuzione logit(U)")
-    ax.set_xlabel("logit(U)")
-    ax.set_ylabel("Frequenza")
-    ax.legend()
-    st.pyplot(fig)
+if uploaded_file:
+    data = pd.read_csv(uploaded_file, index_col=0, parse_dates=True)
+    st.success("✅ File caricato con successo")
 else:
-    st.warning("⚠️ Non abbastanza partizioni per calcolare il PBO.")
+    st.warning("⚠️ Nessun file caricato: uso dataset demo")
+    data = generate_demo_data()
+
+# -------------------------------
+# Run CSCV / PBO test
+# -------------------------------
+st.subheader("Risultati CSCV / PBO")
+
+log_ratios, pbo = cscv_pbo(data)
+
+st.write(f"**PBO (Probabilità di Overfitting):** {pbo:.2%}")
+
+# Distribuzione log-ratios
+chart_data = pd.DataFrame({"log_ratio": log_ratios})
+
+hist = (
+    alt.Chart(chart_data)
+    .mark_bar()
+    .encode(
+        alt.X("log_ratio", bin=alt.Bin(maxbins=20), title="Log(Rank ratio)"),
+        y="count()"
+    )
+    .properties(title="Distribuzione log-ratios (CSCV)", width=600, height=400)
+)
+
+st.altair_chart(hist, use_container_width=True)
+
+# -------------------------------
+# Preview strategies
+# -------------------------------
+st.subheader("Anteprima strategie")
+st.line_chart((1 + data).cumprod())
