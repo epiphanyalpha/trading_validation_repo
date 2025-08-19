@@ -21,6 +21,7 @@ Questa app esegue il test **CSCV / PBO** (Probability of Backtest Overfitting) d
 # -------------------------------
 # Sidebar controls
 # -------------------------------
+
 with st.sidebar:
     st.header("⚙️ Parametri")
     n_partitions = st.number_input("Numero di partizioni (pari)", min_value=2, max_value=24, value=8, step=2)
@@ -28,6 +29,11 @@ with st.sidebar:
     rank_best_is_1 = st.checkbox("Usa convenzione intuitiva: 1 = best", value=True)
     ann_factor = st.number_input("Fattore annualizzazione (Sharpe)", min_value=1, max_value=252, value=252, step=1)
     seed_demo = st.number_input("Seed dataset demo", min_value=0, value=42, step=1)
+
+    # 👉 new control
+    n_strategies_demo = st.number_input("N° strategie (demo)", min_value=1, max_value=200, value=6, step=1)
+    n_periods_demo = st.number_input("N° periodi (demo)", min_value=50, max_value=5000, value=500, step=50)
+
 
 # -------------------------------
 # Utilities
@@ -121,7 +127,12 @@ if uploaded is not None:
     st.success("✅ File caricato")
 else:
     st.info("ℹ️ Nessun file caricato: uso dataset demo")
-    data = generate_demo_data(seed=seed_demo)
+    data = generate_demo_data(
+    n_strategies=int(n_strategies_demo),
+    n_periods=int(n_periods_demo),
+    seed=int(seed_demo)
+)
+
 
 # -------------------------------
 # Run CSCV / PBO
@@ -158,3 +169,4 @@ with st.expander("📄 Dettagli combinazioni IS/OS"):
 # -------------------------------
 st.subheader("Anteprima strategie (equity line cumulativa)")
 st.line_chart((1 + data).cumprod())
+
