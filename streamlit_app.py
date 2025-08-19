@@ -29,102 +29,135 @@ with st.sidebar:
     ann_factor = st.number_input("Fattore annualizzazione (Sharpe)", min_value=1, max_value=252, value=252, step=1)
     seed_demo = st.number_input("Seed dataset demo", min_value=0, value=42, step=1)
 
-    # Demo dataset params
+    # controlli demo
     n_strategies_demo = st.number_input("N° strategie (demo)", min_value=1, max_value=200, value=6, step=1)
-    n_periods_demo = st.number_input("N° periodi (demo)", min_value=20, max_value=5000, value=250, step=10)
-    force_zero_mean = st.checkbox("Forza media 0 (demo)", value=False)
+    n_periods_demo = st.number_input("N° periodi (demo)", min_value=5, max_value=5000, value=250, step=5)
+
+    # limite combinazioni per velocità
+    max_cases = st.number_input("Limite combinazioni (None = tutte)", min_value=0, max_value=50000, value=2000, step=100)
 
 
 # -------------------------------
 # Utilities
 # -------------------------------
-def generate_demo_data(n_strategies=6, n_periods=250, seed=42, sigma=0.01, force_zero_mean=False):
+def generate_demo_data(n_strategies=6, n_periods=250, seed=42, sigma=0.01):
     """
     Genera dati demo: serie di rendimenti i.i.d. ~ N(0, sigma^2).
-    Se force_zero_mean=True, ogni colonna viene de-meanata (media esattamente 0).
+    Nessun drift, tutte le strategie hanno media 0.
     """
     rng = np.random.default_rng(seed)
     data = {
-        f"strategy_{i}": rng.normal(0.0, sigma, size=n_periods)  # strategy_0 ... strategy_{n-1}
+        f"strategy_{i}": rng.normal(0.0, sigma, size=n_periods)
         for i in range(n_strategies)
     }
     df = pd.DataFrame(data, index=pd.date_range("2020-01-01", periods=n_periods, freq="D"))
-    if force_zero_mean:
-        df = df - df.mean(axis=0)
     return df
 
 
-def sharpe_ratio(x: np.ndarray, ann=252, eps=1e-12):
-    mu = np.nanmean(x)
-    sd = np.nanstd(x, ddof=1)
-    if sd < eps:
-        return -np.inf  # penalizza serie piatte
-    return (mu / sd) * np.sqrt(ann)
+def _combine_mean_std(n_vec, sum_mat, sumsq_mat, mask):
+    """
+    Combina statistiche di partizione in media e std per l'unione definita da mask.
+    """
+    n = n_vec[mask].sum()
+    if n <= 1:
+        mean = np.full(sum_mat.shape[1], np.nan, dtype=float)
+        std  = np.full(sum_mat.shape[1], np.nan, dtype=float)
+        return mean, std
+
+    S  = sum_mat[mask].sum(axis=0)
+    SS = sumsq_mat[mask].sum(axis=0)
+
+    mean = S / n
+    var = (SS - (S * S) / n) / (n - 1)
+    var = np.maximum(var, 0.0)  # numerically safe
+    std = np.sqrt(var)
+    return mean, std
 
 
-def perf_series(df: pd.DataFrame, metric: str, ann: int):
-    if metric == "Sharpe":
-        return df.apply(lambda col: sharpe_ratio(col.values, ann=ann), axis=0)
-    else:
-        return df.mean(axis=0)
-
-
-def cscv_pbo(data: pd.DataFrame, n_partitions: int, metric: str, rank_best_is_1: bool, ann: int = 252):
+def cscv_pbo(data: pd.DataFrame, n_partitions: int, metric: str, rank_best_is_1: bool,
+             ann: int = 252, max_cases: int | None = None):
+    """
+    Fast CSCV/PBO:
+      - Precompute per-partition sums & sums of squares
+      - Combine arithmetically for each IS/OS split
+      - Optionally cap the number of cases
+    """
     assert n_partitions % 2 == 0 and n_partitions >= 2, "n_partitions dev'essere un intero pari ≥ 2"
-    N = data.shape[1]  # numero strategie
 
-    # split per tempo
-    splits = np.array_split(data.index, n_partitions)
+    X = data.to_numpy(copy=False)     # (T, N)
+    T, N = X.shape
+    splits = np.array_split(np.arange(T), n_partitions)
+    P = len(splits)
 
-    # tutte le combinazioni IS di taglia n/2 (OS = complementare)
-    combs_IS = list(combinations(range(n_partitions), n_partitions // 2))
-    combs_OS = [sorted(set(range(n_partitions)) - set(c)) for c in combs_IS]
+    n_vec = np.array([len(idx) for idx in splits], dtype=np.int64)
+    sum_mat  = np.stack([X[idx].sum(axis=0)  for idx in splits], axis=0)   # (P,N)
+    sumsq_mat= np.stack([(X[idx]**2).sum(axis=0) for idx in splits], axis=0)
+
+    combs_IS = list(combinations(range(P), P // 2))
+    combs_OS = [tuple(sorted(set(range(P)) - set(c))) for c in combs_IS]
+
+    if max_cases and len(combs_IS) > max_cases:
+        rng = np.random.default_rng(42)
+        sel = rng.choice(len(combs_IS), size=max_cases, replace=False)
+        combs_IS = [combs_IS[i] for i in sel]
+        combs_OS = [combs_OS[i] for i in sel]
 
     logits = []
-    details = []
+    details_rows = []
+
+    sqrt_ann = np.sqrt(float(ann))
 
     for IS_idx, OS_idx in zip(combs_IS, combs_OS):
-        IS_rows = np.concatenate([splits[i] for i in IS_idx])
-        OS_rows = np.concatenate([splits[i] for i in OS_idx])
+        mask_IS = np.zeros(P, dtype=bool); mask_IS[list(IS_idx)] = True
+        mask_OS = ~mask_IS
 
-        df_is = data.loc[IS_rows]
-        df_os = data.loc[OS_rows]
+        mean_IS, std_IS = _combine_mean_std(n_vec, sum_mat, sumsq_mat, mask_IS)
+        if metric == "Sharpe":
+            sharpe_IS = np.where(std_IS > 0, (mean_IS / std_IS) * sqrt_ann, -np.inf)
+            scores_IS = sharpe_IS
+        else:
+            scores_IS = mean_IS
 
-        # punteggi per strategia
-        s_is = perf_series(df_is, metric, ann)
-        winner = s_is.idxmax()
+        tmp = np.where(np.isfinite(scores_IS), scores_IS, -np.inf)
+        winner_idx = int(np.nanargmax(tmp))
+        winner_name = data.columns[winner_idx]
 
-        s_os = perf_series(df_os, metric, ann)
+        mean_OS, std_OS = _combine_mean_std(n_vec, sum_mat, sumsq_mat, mask_OS)
+        if metric == "Sharpe":
+            sharpe_OS = np.where(std_OS > 0, (mean_OS / std_OS) * sqrt_ann, -np.inf)
+            scores_OS = sharpe_OS
+        else:
+            scores_OS = mean_OS
 
-        # rank OOS (1 = best, N = worst) con pandas.rank(ascending=False)
-        r_bestfirst = s_os.rank(ascending=False, method="average")[winner]
+        order_desc = np.argsort(-scores_OS, kind="mergesort")
+        pos = int(np.where(order_desc == winner_idx)[0][0])
+        r_bestfirst = 1.0 + pos  # 1..N
 
-        # converti alla convenzione del paper (1 = worst, N = best)
-        r_paper = N - r_bestfirst + 1 if rank_best_is_1 else r_bestfirst
+        r_paper = (N - r_bestfirst + 1.0) if rank_best_is_1 else r_bestfirst
 
-        # ω in (0,1) usando N+1 per evitare estremi
         omega = float(r_paper) / float(N + 1)
-        omega = min(max(omega, 1e-12), 1 - 1e-12)  # sicurezza numerica
-        lam = np.log(omega / (1.0 - omega))        # logit
+        omega = min(max(omega, 1e-12), 1 - 1e-12)
+        lam = np.log(omega / (1.0 - omega))
 
         logits.append(lam)
-        details.append({
+        details_rows.append({
             "IS_partitions": IS_idx,
             "OS_partitions": OS_idx,
-            "winner": winner,
+            "winner": winner_name,
             "r_bestfirst": float(r_bestfirst),
             "r_paper": float(r_paper),
             "omega": float(omega),
             "lambda": float(lam),
         })
 
-    logits = np.array(logits, dtype=float)
+    logits = np.asarray(logits, dtype=float)
     pbo = float((logits < 0).mean())
-    return logits, pbo, pd.DataFrame(details)
+    df_details = pd.DataFrame(details_rows)
+    return logits, pbo, df_details
 
 
 # -------------------------------
-# File uploader / demo data
+# File uploader
 # -------------------------------
 uploaded = st.file_uploader("📂 Carica CSV (righe=periodi, colonne=strategie)", type=["csv"])
 
@@ -140,8 +173,7 @@ else:
     data = generate_demo_data(
         n_strategies=int(n_strategies_demo),
         n_periods=int(n_periods_demo),
-        seed=int(seed_demo),
-        force_zero_mean=bool(force_zero_mean)
+        seed=int(seed_demo)
     )
 
 
@@ -150,7 +182,9 @@ else:
 # -------------------------------
 st.subheader("Risultati CSCV / PBO")
 logits, pbo, df_details = cscv_pbo(
-    data, n_partitions=int(n_partitions), metric=metric, rank_best_is_1=bool(rank_best_is_1), ann=int(ann_factor)
+    data, n_partitions=n_partitions, metric=metric,
+    rank_best_is_1=rank_best_is_1, ann=ann_factor,
+    max_cases=None if max_cases == 0 else max_cases
 )
 
 cols = st.columns(3)
@@ -171,32 +205,12 @@ hist = (
 )
 st.altair_chart(hist, use_container_width=True)
 
-# -------------------------------
-# Dettagli combinazioni IS/OS
-# -------------------------------
+# Tabella dettagli
 with st.expander("📄 Dettagli combinazioni IS/OS"):
-    st.dataframe(df_details, use_container_width=True)
-    csv = df_details.to_csv(index=False)
-    st.download_button("⬇️ Scarica dettagli CSV", data=csv, file_name="cscv_details.csv", mime="text/csv")
+    st.dataframe(df_details)
 
 # -------------------------------
-# Anteprima strategie (CUMSUM → parte da 0)
+# Anteprima strategie
 # -------------------------------
-st.subheader("Anteprima strategie (cumulative returns, partenza 0)")
-to_plot = data.cumsum()  # <-- cumulative returns, starts at 0
-st.line_chart(to_plot)
-
-# -------------------------------
-# Quick stats
-# -------------------------------
-st.caption("📊 Statistiche rapide (dataset demo corrente)")
-stats = pd.DataFrame({
-    "sample_mean": data.mean(),
-    "sample_std": data.std(ddof=1),
-    "sharpe(ann)": data.apply(lambda c: sharpe_ratio(c.values, ann=int(ann_factor)))
-})
-st.dataframe(stats.style.format({
-    "sample_mean": "{:.6f}",
-    "sample_std": "{:.6f}",
-    "sharpe(ann)": "{:.3f}"
-}))
+st.subheader("Anteprima strategie (cumulata dei rendimenti)")
+st.line_chart(data.cumsum())
