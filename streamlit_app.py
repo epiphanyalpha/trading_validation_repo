@@ -32,7 +32,7 @@ with st.sidebar:
 
     # 👉 new control
     n_strategies_demo = st.number_input("N° strategie (demo)", min_value=1, max_value=200, value=6, step=1)
-    n_periods_demo = st.number_input("N° periodi (demo)", min_value=50, max_value=5000, value=10, step=50)
+    n_periods_demo = st.number_input("N° periodi (demo)", min_value=5, max_value=5000, value=10, step=5)
 
 
 # -------------------------------
@@ -169,5 +169,6 @@ with st.expander("📄 Dettagli combinazioni IS/OS"):
 # -------------------------------
 st.subheader("Anteprima strategie (equity line cumulativa)")
 st.line_chart((1 + data).cumprod())
+
 
 
