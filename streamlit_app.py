@@ -1,4 +1,8 @@
-# streamlit_app.py — Walk-Forward Bundle (concat OOS per configurazione)
+# streamlit_app.py — Walk-Forward Bundle (OOS concatenati) con:
+# - step = OOS per definizione
+# - demo: ritorni NON cumulati, grafico con baseline a 0
+# - tutte le strategie demo plottate
+
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -10,9 +14,11 @@ st.set_page_config(page_title="Walk-Forward Bundle", layout="wide")
 st.title("🚶‍♂️📦 Walk-Forward Bundle — Concatenazione OOS per configurazione")
 
 st.markdown("""
-**Cos'è questo WFB:** generiamo **più walk-forward** (configurazioni diverse di IS/OOS/step/modalità).  
-Per **ogni configurazione**, facciamo i walk-forward e **concateniamo i soli rendimenti OOS** dei vincitori in **un'unica serie OOS**.  
+**Cos'è questo WFB:** generiamo **più walk-forward** (configurazioni diverse di IS / OOS / modalità).
+Per **ogni configurazione**, eseguiamo i walk-forward e **concateniamo i soli rendimenti OOS** del vincitore in **un'unica serie OOS**.
 Poi confrontiamo le configurazioni sulle **metriche calcolate sulla serie OOS concatenata**.
+
+**Nota:** in questo portale **`step = OOS` per definizione** (OOS non sovrapposti).
 """)
 
 # =========================================
@@ -28,14 +34,14 @@ with st.sidebar:
     st.caption("Se non carichi nulla, userò un dataset demo i.i.d. N(0, σ²) dal 2010 in poi.")
 
     st.divider()
-    st.header("🧭 Griglia configurazioni")
+    st.header("🧭 Griglia configurazioni (bundle)")
     start_date   = st.date_input("Data di inizio WFB", value=pd.to_datetime("2013-01-01"))
-    is_years_txt = st.text_input("Lista IS (anni)", value="3,5,8")   # es: 3,5,8
+    is_years_txt = st.text_input("Lista IS (anni)", value="3,5,8")   # es: "3,5,8"
     oos_days_txt = st.text_input("Lista OOS (giorni)", value="63,126")
-    step_days_txt= st.text_input("Lista Step (giorni)", value="63")  # suggerito = OOS
     modes_sel    = st.multiselect("Modalità", ["sliding","expanding"], default=["sliding"])
-
     purge_days   = st.number_input("Embargo/Purge (giorni)", 0, 365, 5, 1)
+
+    st.caption("⚠️ Qui **step = OOS**: non sovrappongo gli OOS per definizione.")
     max_configs  = st.number_input("Limite configurazioni", 1, 500, 50, 1)
     topN_plot    = st.number_input("Top N da plottare", 1, 20, 5, 1)
 
@@ -91,27 +97,30 @@ def metric_scores(metric, mean, std, dn_std, ann, mdd_vec=None):
     if metric == "Mean return": return mean
     if metric == "Sortino":     return sortino(mean, dn_std, ann)
     if metric == "Max Drawdown":
-        # Convertiamo MDD (da minimizzare) in punteggio da massimizzare
+        # trasformo MDD (da minimizzare) in punteggio da massimizzare
         return -mdd_vec
     raise ValueError("Metric not supported")
 
 # =========================================
-# Splits (IS/OOS) per una configurazione
+# Splits (IS/OOS) per una configurazione — step = OOS
 # =========================================
 def build_wf_splits(index: pd.DatetimeIndex, start_date: pd.Timestamp,
-                    is_years: float, oos_days: int, step_days: int,
+                    is_years: float, oos_days: int,
                     mode: str, purge_days: int) -> List[Tuple[int,int,int,int]]:
+    """
+    Ritorna lista di (is_start, is_end, oos_start, oos_end) su POSIZIONI.
+    step = oos_days (OOS NON sovrapposti).
+    """
     idx = pd.DatetimeIndex(index).sort_values()
     T = len(idx)
     if T == 0: return []
     # prima data con IS disponibile (start_date ma con almeno is_years alle spalle)
     min_is_end = idx[0] + pd.DateOffset(years=float(is_years))
     first_oos  = max(pd.to_datetime(start_date), min_is_end)
-    oos_start0 = idx.searchsorted(first_oos, side="left")
-    if oos_start0 >= T: return []
+    oos_start = idx.searchsorted(first_oos, side="left")
+    if oos_start >= T: return []
 
     splits = []
-    oos_start = oos_start0
     while True:
         oos_s = oos_start + int(purge_days)
         oos_e = oos_s + int(oos_days)
@@ -126,7 +135,7 @@ def build_wf_splits(index: pd.DatetimeIndex, start_date: pd.Timestamp,
             is_e = oos_s
             # richiedi almeno is_years anni
             if idx[is_e-1] < (idx[0] + pd.DateOffset(years=float(is_years))):
-                oos_start += int(step_days)
+                oos_start += int(oos_days)  # step = oos_days
                 if oos_start >= T: break
                 continue
         else:
@@ -135,7 +144,7 @@ def build_wf_splits(index: pd.DatetimeIndex, start_date: pd.Timestamp,
         if is_e - is_s >= 2:
             splits.append((is_s, is_e, oos_s, oos_e))
 
-        oos_start += int(step_days)
+        oos_start += int(oos_days)  # step = oos_days
         if oos_start >= T: break
 
     return splits
@@ -143,12 +152,12 @@ def build_wf_splits(index: pd.DatetimeIndex, start_date: pd.Timestamp,
 # =========================================
 # Walk-Forward per una configurazione → serie OOS concatenata
 # =========================================
-def run_wf_config_concat_oos(data: pd.DataFrame, start_date, is_years, oos_days, step_days, mode, purge_days, metric, ann):
+def run_wf_config_concat_oos(data: pd.DataFrame, start_date, is_years, oos_days, mode, purge_days, metric, ann):
     X = data.to_numpy(copy=False)  # (T, N)
     T, N = X.shape
     cs  = np.vstack([np.zeros((1, N)), np.cumsum(X, axis=0)])
     css = np.vstack([np.zeros((1, N)), np.cumsum((X**2), axis=0)])
-    splits = build_wf_splits(data.index, start_date, is_years, oos_days, step_days, mode, purge_days)
+    splits = build_wf_splits(data.index, start_date, is_years, oos_days, mode, purge_days)
 
     # serie OOS concatenata (solo winner di ciascuno split)
     oos_concat = pd.Series(index=data.index, dtype=float)  # NaN di default
@@ -158,7 +167,6 @@ def run_wf_config_concat_oos(data: pd.DataFrame, start_date, is_years, oos_days,
         mean_is, std_is, dn_is = seg_stats(X, cs, css, i0, i1)
 
         if metric == "Max Drawdown":
-            # MDD in IS per tutte le strategie su [i0:i1)
             seg_is = data.iloc[i0:i1]
             mdd_vec = seg_is.apply(lambda s: max_drawdown_series(s), axis=0).to_numpy(dtype=float)
             scores = metric_scores(metric, mean_is, std_is, dn_is, ann, mdd_vec=mdd_vec)
@@ -179,11 +187,11 @@ def run_wf_config_concat_oos(data: pd.DataFrame, start_date, is_years, oos_days,
         mu = oos_ret.mean()
         sd = oos_ret.std(ddof=1)
         dn = oos_ret.where(oos_ret<0, 0.0).std(ddof=1)
-        stats["Mean return"] = float(mu)
-        stats["Sharpe"]      = float((mu/sd)*np.sqrt(ann)) if sd>0 else float("-inf")
-        stats["Sortino"]     = float((mu/dn)*np.sqrt(ann)) if dn>0 else float("-inf")
-        stats["Max Drawdown"]= float(max_drawdown_series(oos_ret))
-        # CAGR su giorni -> approx 252 trading days
+        stats["Mean return"]  = float(mu)
+        stats["Sharpe"]       = float((mu/sd)*np.sqrt(ann)) if sd>0 else float("-inf")
+        stats["Sortino"]      = float((mu/dn)*np.sqrt(ann)) if dn>0 else float("-inf")
+        stats["Max Drawdown"] = float(max_drawdown_series(oos_ret))
+        # CAGR approx (calendario)
         eq = (1.0 + oos_ret).cumprod()
         years = max((eq.index[-1] - eq.index[0]).days / 365.25, 1e-9)
         stats["CAGR"] = float(eq.iloc[-1]**(1/years) - 1)
@@ -195,16 +203,15 @@ def run_wf_config_concat_oos(data: pd.DataFrame, start_date, is_years, oos_days,
     details = {
         "is_years": is_years,
         "oos_days": oos_days,
-        "step_days": step_days,
         "mode": mode,
         "purge_days": purge_days,
-        "splits": len(build_wf_splits(data.index, start_date, is_years, oos_days, step_days, mode, purge_days)),
+        "splits": len(splits),
         "winner_last": winners[-1] if winners else None
     }
     return oos_concat, stats, details
 
 # =========================================
-# Carica dati
+# Carica dati (upload o demo)
 # =========================================
 if uploaded is not None:
     data = pd.read_csv(uploaded, index_col=0)
@@ -216,7 +223,34 @@ else:
     data = generate_demo(n_strategies, n_periods, sigma_demo, seed_demo)
 
 # =========================================
-# Costruisci griglia configurazioni
+# Anteprima DEMO: ritorni NON cumulati (tutte le strategie)
+# =========================================
+st.subheader("Anteprima demo — RITORNI non cumulati (tutte le strategie)")
+# Avviso se sono tante colonne (ma le plottiamo comunque)
+if data.shape[1] > 60:
+    st.warning(f"Stai plottando {data.shape[1]} strategie: il grafico potrebbe risultare pesante/affollato.")
+
+returns_long = (
+    data.reset_index()
+        .melt("index", var_name="strategy", value_name="return")
+        .rename(columns={"index":"date"})
+)
+
+chart_returns = (
+    alt.Chart(returns_long)
+    .mark_line(opacity=0.85)
+    .encode(
+        x=alt.X("date:T", title="Data"),
+        y=alt.Y("return:Q", title="Ritorno (non cumulato)", scale=alt.Scale(zero=True)),  # baseline a 0
+        color=alt.Color("strategy:N", title="Strategia", legend=None if data.shape[1] > 25 else alt.Legend())
+    )
+    .properties(height=280)
+    .interactive()
+)
+st.altair_chart(chart_returns, use_container_width=True)
+
+# =========================================
+# Costruisci griglia configurazioni (step = OOS)
 # =========================================
 def parse_list_nums(txt):
     vals = []
@@ -226,33 +260,32 @@ def parse_list_nums(txt):
         vals.append(float(x))
     return vals
 
-IS_list   = parse_list_nums(is_years_txt)      # anni
+IS_list   = parse_list_nums(is_years_txt)            # anni
 OOS_list  = [int(x) for x in parse_list_nums(oos_days_txt)]   # giorni
-STEP_list = [int(x) for x in parse_list_nums(step_days_txt)]  # giorni
 modes     = modes_sel if modes_sel else ["sliding"]
 
-grid = list(product(IS_list, OOS_list, STEP_list, modes))
+# grid di (IS, OOS, mode); step = OOS "by design"
+grid = list(product(IS_list, OOS_list, modes))
 if len(grid) > max_configs:
     grid = grid[:max_configs]
     st.info(f"🔎 Configurazioni limitate a {max_configs} (usa 'Limite configurazioni' per aumentare).")
 
-st.write(f"**Configurazioni nel bundle:** {len(grid)}")
+st.write(f"**Configurazioni nel bundle:** {len(grid)} — (step = OOS)")
 
 # =========================================
 # Esegui il Bundle
 # =========================================
 bundle_rows = []
-equities = {}  # config_key -> equity series
+equities = {}                # config_key -> equity OOS concatenata
 oos_concat_map: Dict[str, pd.Series] = {}
 
-for (is_y, oos_d, step_d, mode) in grid:
+for (is_y, oos_d, mode) in grid:
     oos_concat, stats, details = run_wf_config_concat_oos(
         data, start_date=pd.to_datetime(start_date),
-        is_years=is_y, oos_days=oos_d, step_days=step_d,
-        mode=mode, purge_days=int(purge_days),
+        is_years=is_y, oos_days=oos_d, mode=mode, purge_days=int(purge_days),
         metric=metric, ann=int(ann)
     )
-    key = f"IS={is_y}y | OOS={oos_d}d | step={step_d} | {mode}"
+    key = f"IS={is_y}y | OOS={oos_d}d | {mode}"
     oos_concat_map[key] = oos_concat
 
     row = {"config": key, **stats, **details}
@@ -289,11 +322,11 @@ if not df_bundle.empty:
     st.altair_chart(chart, use_container_width=True)
 
 # =========================================
-# Distribuzione metrica OOS (Sharpe o altro)
+# Distribuzione metrica OOS concatenata
 # =========================================
 if not df_bundle.empty:
     metric_col = metric if metric in df_bundle.columns else "Sharpe"
-    st.subheader(f"Distribuzione della metrica OOS concatenata: {metric_col}")
+    st.subheader(f"Distribuzione metrica sulla serie OOS concatenata: {metric_col}")
     ch = (
         alt.Chart(df_bundle[[metric_col]])
         .mark_bar()
@@ -312,7 +345,6 @@ st.download_button(
     mime="text/csv"
 )
 
-# opzionale: esporta le OOS concatenate delle TopN
 if not df_bundle.empty:
     out = pd.DataFrame({k: oos_concat_map[k] for k in df_bundle["config"].head(int(topN_plot))})
     st.download_button(
