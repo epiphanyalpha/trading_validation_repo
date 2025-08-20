@@ -306,34 +306,42 @@ else:
 # Intro “animata” (step-by-step) con Skip
 # =========================================
 with st.expander("🎬 Intro passo-passo (clicca per aprire)"):
-    st.write("Questa mini-demo mostra come il WFB seleziona il vincitore IS e valuta OOS.")
-    colA, colB = st.columns([1, 1])
-    with colA:
-        demo_idx = st.slider("Seleziona split", 0, max(0, len(splits)-1), 0, 1)
-    with colB:
-        st.caption("Premi ➤ per avanzare, oppure chiudi l’intro se sai già cos’è il WFB.")
+    if len(splits) <= 0:
+        st.info("Nessuno split disponibile con i parametri correnti: regola start date / IS minimo / OOS / step.")
+    elif len(splits) == 1:
+        st.caption("È stato generato un solo split; lo slider non è necessario.")
+        demo_idx = 0
+    else:
+        demo_idx = st.slider("Seleziona split", min_value=0, max_value=len(splits)-1, value=0, step=1)
+
     if len(splits) > 0:
+        # (Per alleggerire, puoi anche sottocampionare righe/strategie qui)
         i0, i1, o0, o1 = splits[demo_idx]
         eq = (1.0 + data).cumprod()
-        df_plot = eq.reset_index().rename(columns={"index":"date"})
-        df_long = df_plot.melt("date", var_name="strategy", value_name="equity")
-        # Segnaliamo visivamente IS/OOS
-        is_start, is_end = data.index[i0], data.index[i1-1]
-        oos_start, oos_end = data.index[o0], data.index[o1-1]
-        band = pd.DataFrame({
-            "start":[is_start, oos_start],
-            "end":[is_end, oos_end],
-            "phase":["IS","OOS"]
-        })
-        base = alt.Chart(df_long).mark_line().encode(
-            x="date:T", y=alt.Y("equity:Q", title="Equity (cumprod)"),
-            color="strategy:N"
-        ).properties(height=300)
-        band_chart = alt.Chart(band).mark_rect(opacity=0.12).encode(
-            x="start:T", x2="end:T", color=alt.Color("phase:N", scale=alt.Scale(range=["#999999","#1f77b4"]))
+        df_long = (
+            eq.reset_index()
+              .melt("index", var_name="strategy", value_name="equity")
+              .rename(columns={"index":"date"})
         )
+
+        is_start, is_end  = data.index[i0], data.index[i1-1]
+        oos_start, oos_end= data.index[o0], data.index[o1-1]
+        band = pd.DataFrame({"start":[is_start, oos_start], "end":[is_end, oos_end], "phase":["IS","OOS"]})
+
+        base = alt.Chart(df_long).mark_line().encode(
+            x="date:T",
+            y=alt.Y("equity:Q", title="Equity (cumprod)"),
+            color=alt.Color("strategy:N")
+        ).properties(height=300)
+
+        band_chart = alt.Chart(band).mark_rect(opacity=0.12).encode(
+            x="start:T", x2="end:T",
+            color=alt.Color("phase:N", scale=alt.Scale(range=["#999999","#1f77b4"]))
+        )
+
         st.altair_chart(band_chart + base, use_container_width=True)
         st.caption(f"IS: {is_start.date()} → {is_end.date()}  |  OOS: {oos_start.date()} → {oos_end.date()}")
+
 
 # =========================================
 # Run Walk-Forward Bundle
@@ -370,3 +378,4 @@ if len(splits) > 0:
     # Download dettagli
     csv = res.details.to_csv(index=False)
     st.download_button("⬇️ Scarica dettagli WFB (CSV)", data=csv, file_name="wfb_details.csv", mime="text/csv")
+
