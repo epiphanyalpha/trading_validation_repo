@@ -1,166 +1,273 @@
-# app.py
+# app.py — Walk-Forward Bundle Dashboard (no CSCV)
 import streamlit as st
 import pandas as pd
 import numpy as np
 import altair as alt
-from itertools import combinations
+from dataclasses import dataclass
+from typing import List, Tuple
 
-st.set_page_config(page_title="Dashboard Validazione Trading", layout="wide")
-st.title("📊 Dashboard Validazione Trading")
+st.set_page_config(page_title="Walk-Forward Bundle", layout="wide")
+st.title("🚶‍♂️📦 Walk-Forward Bundle — Validazione Strategie")
 
 st.markdown("""
-Questa app esegue il test **CSCV / PBO** (Probability of Backtest Overfitting) di López de Prado.
-- Divide la serie temporale in *n* partizioni uguali.
-- Genera **tutte** le combinazioni IS/OS con IS = OS = n/2.
-- Seleziona la strategia **migliore in-sample**, ne valuta il **rank out-of-sample** e calcola:
-\\[
-\\omega = \\frac{r}{N+1},\\qquad \\lambda = \\log\\frac{\\omega}{1-\\omega},\\qquad \\text{PBO} = \\Pr[\\lambda < 0].
-\\]
+Questa app esegue un **Walk-Forward Bundle (WFB)**:
+- L'utente sceglie **data di inizio**, **lunghezza IS minima**, **lunghezza OOS**, **step** (frequenza ricalibrazione), **modalità** (sliding/expanding), **purge/embargo**.
+- Per ciascuno split: si seleziona la **migliore strategia in-sample** secondo una **metrica** (Sharpe, return medio, Sortino, Max Drawdown), e si misura la **stessa metrica out-of-sample**.
+- Il bundle produce una **distribuzione OOS** (mediana, percentili, hit-rate) e viste interattive.
 """)
 
-# -------------------------------
-# Sidebar controls
-# -------------------------------
+# =========================================
+# Sidebar — Parametri
+# =========================================
 with st.sidebar:
-    st.header("⚙️ Parametri")
-    n_partitions = st.number_input("Numero di partizioni (pari)", min_value=2, max_value=24, value=8, step=2)
-    metric = st.selectbox("Metrica performance", ["Sharpe", "Mean return"])
-    rank_best_is_1 = st.checkbox("Usa convenzione intuitiva: 1 = best", value=True)
-    ann_factor = st.number_input("Fattore annualizzazione (Sharpe)", min_value=1, max_value=252, value=252, step=1)
-    seed_demo = st.number_input("Seed dataset demo", min_value=0, value=42, step=1)
+    st.header("⚙️ Dati demo / Upload")
+    n_strategies_demo = st.number_input("N° strategie (demo)", 1, 500, 8, 1)
+    n_periods_demo    = st.number_input("N° periodi (demo)", 50, 20000, 1000, 50)
+    sigma_demo        = st.number_input("Vol demo σ", 0.0001, 0.1, 0.01, 0.0001, format="%.4f")
+    seed_demo         = st.number_input("Seed demo", 0, 10_000, 42, 1)
 
-    # controlli demo
-    n_strategies_demo = st.number_input("N° strategie (demo)", min_value=1, max_value=200, value=6, step=1)
-    n_periods_demo = st.number_input("N° periodi (demo)", min_value=5, max_value=5000, value=250, step=5)
+    uploaded = st.file_uploader("📂 Carica CSV (righe=periodi, colonne=strategie)", type=["csv"])
+    st.caption("Se non carichi nulla, userò un dataset demo i.i.d. N(0, σ²).")
 
-    # limite combinazioni per velocità
-    max_cases = st.number_input("Limite combinazioni (None = tutte)", min_value=0, max_value=50000, value=2000, step=100)
+    st.divider()
+    st.header("🧭 Walk-Forward")
+    start_date   = st.date_input("Data di inizio WFB", value=pd.to_datetime("2013-01-01"))
+    min_is_years = st.number_input("IS minimo (anni)", 0.5, 50.0, 5.0, 0.5)
+    test_len_days= st.number_input("Lunghezza OOS (giorni)", 5, 5000, 63, 1)
+    step_days    = st.number_input("Step tra split (giorni)", 1, 5000, 63, 1)
+    wf_mode      = st.selectbox("Modalità", ["sliding", "expanding"])
+    purge_days   = st.number_input("Embargo/Purge (giorni)", 0, 365, 5, 1)
 
+    insuff_policy= st.selectbox("Policy IS insufficiente", [
+        "shift_start (consigliata)", "strict", "shorten_IS"
+    ])
 
-# -------------------------------
-# Utilities
-# -------------------------------
-def generate_demo_data(n_strategies=6, n_periods=250, seed=42, sigma=0.01):
-    """
-    Genera dati demo: serie di rendimenti i.i.d. ~ N(0, sigma^2).
-    Nessun drift, tutte le strategie hanno media 0.
-    """
-    rng = np.random.default_rng(seed)
+    st.divider()
+    st.header("📏 Metrica")
+    metric = st.selectbox("Metrica di selezione / valutazione", [
+        "Sharpe", "Mean return", "Sortino", "Max Drawdown"
+    ])
+    ann_factor = st.number_input("Fattore annualizzazione (Sharpe/Sortino)", 1, 252, 252, 1)
+
+    st.divider()
+    st.header("🏃 Performance")
+    max_splits = st.number_input("Limite split (0 = tutti)", 0, 10000, 0, 10)
+    cache_toggle = st.checkbox("Cache risultati (veloce)", value=True)
+
+# =========================================
+# Utilities — Dati & Metriche
+# =========================================
+def generate_demo_data(n_strategies=6, n_periods=1000, sigma=0.01, seed=42):
+    rng = np.random.default_rng(int(seed))
     data = {
-        f"strategy_{i}": rng.normal(0.0, sigma, size=n_periods)
-        for i in range(n_strategies)
+        f"strategy_{i}": rng.normal(0.0, float(sigma), size=int(n_periods))
+        for i in range(int(n_strategies))
     }
-    df = pd.DataFrame(data, index=pd.date_range("2020-01-01", periods=n_periods, freq="D"))
-    return df
+    idx = pd.date_range("2010-01-01", periods=int(n_periods), freq="D")
+    return pd.DataFrame(data, index=idx)
 
-
-def _combine_mean_std(n_vec, sum_mat, sumsq_mat, mask):
+def cum_stats_segment(X, cs, css, a, b):
     """
-    Combina statistiche di partizione in media e std per l'unione definita da mask.
+    Statistiche per il segmento [a, b) su tutte le strategie (colonne di X):
+    - mean, std (unbiased)
+    - downside std (per Sortino, soglia 0)
     """
-    n = n_vec[mask].sum()
+    n = b - a
     if n <= 1:
-        mean = np.full(sum_mat.shape[1], np.nan, dtype=float)
-        std  = np.full(sum_mat.shape[1], np.nan, dtype=float)
-        return mean, std
-
-    S  = sum_mat[mask].sum(axis=0)
-    SS = sumsq_mat[mask].sum(axis=0)
-
+        N = X.shape[1]
+        nan = np.nan
+        return (np.full(N, nan), np.full(N, nan), np.full(N, nan))
+    S  = cs[b]  - cs[a]            # (N,)
+    SS = css[b] - css[a]           # (N,)
     mean = S / n
-    var = (SS - (S * S) / n) / (n - 1)
-    var = np.maximum(var, 0.0)  # numerically safe
-    std = np.sqrt(var)
-    return mean, std
+    var  = (SS - (S*S)/n) / (n - 1)
+    var  = np.maximum(var, 0.0)
+    std  = np.sqrt(var)
 
+    # Downside std (returns < 0): calcolo con maschera locale per accuratezza
+    seg = X[a:b]                   # (n, N)
+    neg = np.where(seg < 0.0, seg, 0.0)
+    dn_std = neg.std(axis=0, ddof=1)
+    return mean, std, dn_std
 
-def cscv_pbo(data: pd.DataFrame, n_partitions: int, metric: str, rank_best_is_1: bool,
-             ann: int = 252, max_cases: int | None = None):
+def max_drawdown_segment(X, a, b):
     """
-    Fast CSCV/PBO:
-      - Precompute per-partition sums & sums of squares
-      - Combine arithmetically for each IS/OS split
-      - Optionally cap the number of cases
+    Max Drawdown per strategia nel segmento [a,b):
+    Usa equity = cumprod(1+r); MDD = max peak-to-trough (in %).
+    Ritorna array (N,) con valori positivi (es. 0.12 = -12%).
     """
-    assert n_partitions % 2 == 0 and n_partitions >= 2, "n_partitions dev'essere un intero pari ≥ 2"
+    seg = X[a:b]  # (n, N)
+    if seg.shape[0] == 0:
+        return np.full(seg.shape[1], np.nan)
+    equity = (1.0 + seg).cumprod(axis=0)
+    peak = np.maximum.accumulate(equity, axis=0)
+    dd = (peak - equity) / peak
+    return dd.max(axis=0)
 
-    X = data.to_numpy(copy=False)     # (T, N)
-    T, N = X.shape
-    splits = np.array_split(np.arange(T), n_partitions)
-    P = len(splits)
-
-    n_vec = np.array([len(idx) for idx in splits], dtype=np.int64)
-    sum_mat  = np.stack([X[idx].sum(axis=0)  for idx in splits], axis=0)   # (P,N)
-    sumsq_mat= np.stack([(X[idx]**2).sum(axis=0) for idx in splits], axis=0)
-
-    combs_IS = list(combinations(range(P), P // 2))
-    combs_OS = [tuple(sorted(set(range(P)) - set(c))) for c in combs_IS]
-
-    if max_cases and len(combs_IS) > max_cases:
-        rng = np.random.default_rng(42)
-        sel = rng.choice(len(combs_IS), size=max_cases, replace=False)
-        combs_IS = [combs_IS[i] for i in sel]
-        combs_OS = [combs_OS[i] for i in sel]
-
-    logits = []
-    details_rows = []
-
+def score_from_metric(metric: str, mean, std, dn_std, ann: int, mdd=None):
     sqrt_ann = np.sqrt(float(ann))
+    if metric == "Sharpe":
+        with np.errstate(divide='ignore', invalid='ignore'):
+            score = np.where(std > 0, (mean / std) * sqrt_ann, -np.inf)
+    elif metric == "Mean return":
+        score = mean
+    elif metric == "Sortino":
+        with np.errstate(divide='ignore', invalid='ignore'):
+            score = np.where(dn_std > 0, (mean / dn_std) * sqrt_ann, -np.inf)
+    elif metric == "Max Drawdown":
+        # per selezione IS vogliamo *minimizzare* MDD -> trasformo in "più alto è meglio"
+        # score = -MDD
+        score = -mdd
+    else:
+        raise ValueError("Metrica non supportata")
+    return score
 
-    for IS_idx, OS_idx in zip(combs_IS, combs_OS):
-        mask_IS = np.zeros(P, dtype=bool); mask_IS[list(IS_idx)] = True
-        mask_OS = ~mask_IS
+# =========================================
+# Build Walk-Forward Splits (con policy)
+# =========================================
+def build_wf_splits(index: pd.DatetimeIndex,
+                    start_date: pd.Timestamp,
+                    min_is_years: float,
+                    test_len_days: int,
+                    step_days: int,
+                    mode: str = "sliding",
+                    insuff_policy: str = "shift_start (consigliata)",
+                    purge_days: int = 0) -> List[Tuple[int,int,int,int]]:
+    idx = pd.DatetimeIndex(index).sort_values()
+    T = len(idx)
+    if T == 0:
+        return []
 
-        mean_IS, std_IS = _combine_mean_std(n_vec, sum_mat, sumsq_mat, mask_IS)
-        if metric == "Sharpe":
-            sharpe_IS = np.where(std_IS > 0, (mean_IS / std_IS) * sqrt_ann, -np.inf)
-            scores_IS = sharpe_IS
+    min_is_end_date = idx[0] + pd.DateOffset(years=float(min_is_years))
+    first_oos_candidate = max(pd.to_datetime(start_date), min_is_end_date)
+    pos_first_oos = idx.searchsorted(first_oos_candidate, side="left")
+    if pos_first_oos >= T:
+        return []
+
+    def _find_is_bounds(oos_start_pos):
+        if mode == "sliding":
+            is_start_date = idx[oos_start_pos] - pd.DateOffset(years=float(min_is_years))
+            is_start_pos = idx.searchsorted(is_start_date, side="left")
+            is_end_pos = oos_start_pos
+            return (is_start_pos, is_end_pos)
+        elif mode == "expanding":
+            is_start_pos = 0
+            is_end_pos = oos_start_pos
+            if idx[is_end_pos - 1] < (idx[0] + pd.DateOffset(years=float(min_is_years))):
+                return None
+            return (is_start_pos, is_end_pos)
         else:
-            scores_IS = mean_IS
+            raise ValueError("mode deve essere 'sliding' o 'expanding'")
 
-        tmp = np.where(np.isfinite(scores_IS), scores_IS, -np.inf)
-        winner_idx = int(np.nanargmax(tmp))
-        winner_name = data.columns[winner_idx]
+    splits = []
+    oos_start_pos = pos_first_oos
+    while True:
+        oos_start_eff = oos_start_pos + int(purge_days)
+        if oos_start_eff >= T:
+            break
+        oos_end = oos_start_eff + int(test_len_days)
+        if oos_end > T:
+            break
 
-        mean_OS, std_OS = _combine_mean_std(n_vec, sum_mat, sumsq_mat, mask_OS)
-        if metric == "Sharpe":
-            sharpe_OS = np.where(std_OS > 0, (mean_OS / std_OS) * sqrt_ann, -np.inf)
-            scores_OS = sharpe_OS
+        bounds = _find_is_bounds(oos_start_eff)
+        if bounds is None:
+            if insuff_policy.startswith("shift_start"):
+                oos_start_pos += int(step_days)
+                if oos_start_pos >= T:
+                    break
+                continue
+            elif insuff_policy == "strict":
+                break
+            elif insuff_policy == "shorten_IS":
+                is_start_pos, is_end_pos = 0, oos_start_eff
+            else:
+                break
         else:
-            scores_OS = mean_OS
+            is_start_pos, is_end_pos = bounds
 
-        order_desc = np.argsort(-scores_OS, kind="mergesort")
-        pos = int(np.where(order_desc == winner_idx)[0][0])
-        r_bestfirst = 1.0 + pos  # 1..N
+        # IS almeno 2 osservazioni
+        if is_end_pos - is_start_pos < 2:
+            oos_start_pos += int(step_days)
+            if oos_start_pos >= T:
+                break
+            continue
 
-        r_paper = (N - r_bestfirst + 1.0) if rank_best_is_1 else r_bestfirst
+        splits.append((is_start_pos, is_end_pos, oos_start_eff, oos_end))
+        oos_start_pos += int(step_days)
+        if oos_start_pos >= T:
+            break
 
-        omega = float(r_paper) / float(N + 1)
-        omega = min(max(omega, 1e-12), 1 - 1e-12)
-        lam = np.log(omega / (1.0 - omega))
+    return splits
 
-        logits.append(lam)
-        details_rows.append({
-            "IS_partitions": IS_idx,
-            "OS_partitions": OS_idx,
-            "winner": winner_name,
-            "r_bestfirst": float(r_bestfirst),
-            "r_paper": float(r_paper),
-            "omega": float(omega),
-            "lambda": float(lam),
+# =========================================
+# Walk-Forward Bundle core (veloce + caching)
+# =========================================
+@dataclass
+class WFBResult:
+    oos_scores: np.ndarray
+    details: pd.DataFrame
+
+def _run_wfb_core(data: pd.DataFrame, splits, metric: str, ann: int) -> WFBResult:
+    X = data.to_numpy(copy=False)           # (T, N)
+    T, N = X.shape
+    cs  = np.vstack([np.zeros((1, N)), np.cumsum(X, axis=0)])       # (T+1, N)
+    css = np.vstack([np.zeros((1, N)), np.cumsum(X**2, axis=0)])    # (T+1, N)
+
+    oos_scores = []
+    rows = []
+
+    for k, (i0, i1, o0, o1) in enumerate(splits):
+        # IS stats
+        mean_is, std_is, dn_is = cum_stats_segment(X, cs, css, i0, i1)
+        mdd_is = max_drawdown_segment(X, i0, i1) if metric == "Max Drawdown" else None
+        is_scores = score_from_metric(metric, mean_is, std_is, dn_is, ann, mdd=mdd_is)
+
+        # winner (miglior score IS)
+        tmp = np.where(np.isfinite(is_scores), is_scores, -np.inf)
+        w_idx = int(np.nanargmax(tmp))
+        winner = data.columns[w_idx]
+
+        # OOS stats per il winner
+        mean_oos, std_oos, dn_oos = cum_stats_segment(X, cs, css, o0, o1)
+        if metric == "Max Drawdown":
+            mdd_oos_all = max_drawdown_segment(X, o0, o1)
+            oos_score = -mdd_oos_all[w_idx]  # coerente con score = -MDD
+        else:
+            if metric == "Sharpe":
+                oos_score = (mean_oos[w_idx] / std_oos[w_idx]) * np.sqrt(ann) if (std_oos[w_idx] > 0 and np.isfinite(mean_oos[w_idx])) else -np.inf
+            elif metric == "Mean return":
+                oos_score = mean_oos[w_idx]
+            elif metric == "Sortino":
+                oos_score = (mean_oos[w_idx] / dn_oos[w_idx]) * np.sqrt(ann) if (dn_oos[w_idx] > 0 and np.isfinite(mean_oos[w_idx])) else -np.inf
+            else:
+                oos_score = np.nan
+
+        oos_scores.append(float(oos_score))
+        rows.append({
+            "split": k,
+            "IS_idx": (i0, i1),
+            "OOS_idx": (o0, o1),
+            "winner": winner,
+            "IS_score_winner": float(is_scores[w_idx]),
+            "OOS_score_winner": float(oos_score),
         })
 
-    logits = np.asarray(logits, dtype=float)
-    pbo = float((logits < 0).mean())
-    df_details = pd.DataFrame(details_rows)
-    return logits, pbo, df_details
+    return WFBResult(oos_scores=np.asarray(oos_scores, dtype=float),
+                     details=pd.DataFrame(rows))
 
+@st.cache_data(show_spinner=False)
+def run_wfb_cached(data: pd.DataFrame, splits, metric: str, ann: int) -> WFBResult:
+    # per caching: indicizza con stringhe
+    key_df = data.copy()
+    key_df.index = key_df.index.astype(str)
+    return _run_wfb_core(key_df, splits, metric, ann)
 
-# -------------------------------
-# File uploader
-# -------------------------------
-uploaded = st.file_uploader("📂 Carica CSV (righe=periodi, colonne=strategie)", type=["csv"])
+def run_wfb(data: pd.DataFrame, splits, metric: str, ann: int, use_cache=True) -> WFBResult:
+    return run_wfb_cached(data, splits, metric, ann) if use_cache else _run_wfb_core(data, splits, metric, ann)
 
+# =========================================
+# Load dati (upload o demo)
+# =========================================
 if uploaded is not None:
     data = pd.read_csv(uploaded, index_col=0)
     try:
@@ -169,48 +276,97 @@ if uploaded is not None:
         pass
     st.success("✅ File caricato")
 else:
-    st.info("ℹ️ Nessun file caricato: uso dataset demo")
-    data = generate_demo_data(
-        n_strategies=int(n_strategies_demo),
-        n_periods=int(n_periods_demo),
-        seed=int(seed_demo)
-    )
+    st.info("ℹ️ Nessun file caricato: uso dataset demo i.i.d. N(0, σ²)")
+    data = generate_demo_data(n_strategies=n_strategies_demo,
+                              n_periods=n_periods_demo,
+                              sigma=sigma_demo,
+                              seed=seed_demo)
 
-
-# -------------------------------
-# Run CSCV / PBO
-# -------------------------------
-st.subheader("Risultati CSCV / PBO")
-logits, pbo, df_details = cscv_pbo(
-    data, n_partitions=n_partitions, metric=metric,
-    rank_best_is_1=rank_best_is_1, ann=ann_factor,
-    max_cases=None if max_cases == 0 else max_cases
+# =========================================
+# Build splits & limit numero
+# =========================================
+splits = build_wf_splits(
+    data.index,
+    start_date=pd.to_datetime(start_date),
+    min_is_years=min_is_years,
+    test_len_days=test_len_days,
+    step_days=step_days,
+    mode=wf_mode,
+    insuff_policy=insuff_policy,
+    purge_days=purge_days
 )
+if len(splits) == 0:
+    st.warning("Nessuno split generato: aumenta la serie, riduci IS minimo o cambia la policy.")
+else:
+    if max_splits and len(splits) > max_splits:
+        splits = splits[:max_splits]
+        st.info(f"🔎 Split limitati a {max_splits} (di {len(splits)} disponibili).")
 
-cols = st.columns(3)
-cols[0].metric("PBO (Prob. overfitting)", f"{pbo:.2%}")
-cols[1].metric("N° combinazioni", f"{len(logits)}")
-cols[2].metric("λ mediano", f"{np.median(logits):.3f}")
+# =========================================
+# Intro “animata” (step-by-step) con Skip
+# =========================================
+with st.expander("🎬 Intro passo-passo (clicca per aprire)"):
+    st.write("Questa mini-demo mostra come il WFB seleziona il vincitore IS e valuta OOS.")
+    colA, colB = st.columns([1, 1])
+    with colA:
+        demo_idx = st.slider("Seleziona split", 0, max(0, len(splits)-1), 0, 1)
+    with colB:
+        st.caption("Premi ➤ per avanzare, oppure chiudi l’intro se sai già cos’è il WFB.")
+    if len(splits) > 0:
+        i0, i1, o0, o1 = splits[demo_idx]
+        eq = (1.0 + data).cumprod()
+        df_plot = eq.reset_index().rename(columns={"index":"date"})
+        df_long = df_plot.melt("date", var_name="strategy", value_name="equity")
+        # Segnaliamo visivamente IS/OOS
+        is_start, is_end = data.index[i0], data.index[i1-1]
+        oos_start, oos_end = data.index[o0], data.index[o1-1]
+        band = pd.DataFrame({
+            "start":[is_start, oos_start],
+            "end":[is_end, oos_end],
+            "phase":["IS","OOS"]
+        })
+        base = alt.Chart(df_long).mark_line().encode(
+            x="date:T", y=alt.Y("equity:Q", title="Equity (cumprod)"),
+            color="strategy:N"
+        ).properties(height=300)
+        band_chart = alt.Chart(band).mark_rect(opacity=0.12).encode(
+            x="start:T", x2="end:T", color=alt.Color("phase:N", scale=alt.Scale(range=["#999999","#1f77b4"]))
+        )
+        st.altair_chart(band_chart + base, use_container_width=True)
+        st.caption(f"IS: {is_start.date()} → {is_end.date()}  |  OOS: {oos_start.date()} → {oos_end.date()}")
 
-# Distribuzione λ
-chart_data = pd.DataFrame({"lambda": logits})
-hist = (
-    alt.Chart(chart_data)
-    .mark_bar()
-    .encode(
-        alt.X("lambda", bin=alt.Bin(maxbins=30), title="λ = logit(ω)"),
-        y=alt.Y("count()", title="Frequenza")
-    )
-    .properties(title="Distribuzione di λ (CSCV)", width=700, height=400)
-)
-st.altair_chart(hist, use_container_width=True)
+# =========================================
+# Run Walk-Forward Bundle
+# =========================================
+if len(splits) > 0:
+    res = run_wfb(data, splits, metric=metric, ann=ann_factor, use_cache=cache_toggle)
 
-# Tabella dettagli
-with st.expander("📄 Dettagli combinazioni IS/OS"):
-    st.dataframe(df_details)
+    # KPI
+    oos = res.oos_scores
+    med = float(np.nanmedian(oos)) if oos.size else np.nan
+    p20 = float(np.nanpercentile(oos, 20)) if oos.size else np.nan
+    hit = float(np.nanmean(oos > 0.0)) if oos.size else np.nan
 
-# -------------------------------
-# Anteprima strategie
-# -------------------------------
-st.subheader("Anteprima strategie (cumulata dei rendimenti)")
-st.line_chart(data.cumsum())
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Split OOS", f"{len(oos)}")
+    c2.metric("Mediana OOS", f"{med:.4f}")
+    c3.metric("20° percentile OOS", f"{p20:.4f}")
+    c4.metric("Hit-rate (OOS>0)", f"{hit:.0%}")
+
+    # Istogramma OOS
+    st.subheader("Distribuzione performance OOS")
+    chart_data = pd.DataFrame({"OOS_score": oos})
+    hist = (alt.Chart(chart_data)
+        .mark_bar()
+        .encode(alt.X("OOS_score:Q", bin=alt.Bin(maxbins=40), title=f"Metrica OOS ({metric})"),
+                y=alt.Y("count()", title="Frequenza"))
+        .properties(height=320))
+    st.altair_chart(hist, use_container_width=True)
+
+    # Boxplot per strategia vincitrice (opzionale)
+    st.subheader("Vincitori IS per split")
+    st.dataframe(res.details[["split","winner","IS_score_winner","OOS_score_winner"]])
+
+    # Download dettagli
+    csv = res.details.to_csv(index=False)
+    st.download_button("⬇️ Scarica dettagli WFB (CSV)", data=csv, file_name="wfb_details.csv", mime="text/csv")
