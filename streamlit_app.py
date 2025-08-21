@@ -79,12 +79,13 @@ def load_csv(file) -> pd.DataFrame:
     df = df.dropna(axis=1, how="all")
     return df
 
-@st.cache_data(show_spinner=False)
-def infer_ann(idx: pd.Index) -> int:
-    if isinstance(idx, pd.DatetimeIndex):
+def infer_ann_from_index(idx: pd.Index) -> int:
+    # Not cached: idx is unhashable for Streamlit caching. This is cheap anyway.
+    if isinstance(idx, pd.DatetimeIndex) and len(idx) > 1:
         try:
             f = pd.infer_freq(idx)
-            if f in ("B", "C"): return 252
+            if f in ("B", "C"):
+                return 252
             return 365
         except Exception:
             return 252
@@ -310,7 +311,7 @@ else:
 # Optionally auto-set ann default on first load
 if 'ann_initialized' not in st.session_state:
     st.session_state['ann_initialized'] = True
-    ann_default = infer_ann(data.index)
+    ann_default = infer_ann_from_index(data.index)
     if ann == 252 and ann_default != 252:
         st.toast(f"Nota: frequenza rilevata → ann={ann_default}")
 
