@@ -450,27 +450,44 @@ else:
     with tab_heatmap:
         st.subheader("🗺️ Heatmap della metrica sulla griglia (per modalità selezionata)")
         if not df_bundle.empty:
-            # build a compact df for heatmap
+            # Build compact df for heatmap
             hm = df_bundle.copy()
             hm["IS"] = [x.split("|")[0].split("=")[1].strip() for x in hm["config"]]
             hm["OOS"] = [x.split("|")[1].split("=")[1].strip() for x in hm["config"]]
             hm["Mode"] = hm["mode"].astype(str)
+    
             metric_col = metric if metric in hm.columns else "Sharpe"
-            ch = (
+    
+            # Ensure metric is numeric for color=...:Q
+            hm[metric_col] = pd.to_numeric(hm[metric_col], errors="coerce")
+    
+            base = (
                 alt.Chart(hm)
                 .mark_rect()
                 .encode(
                     x=alt.X("IS:N", title=f"IS ({time_unit})"),
                     y=alt.Y("OOS:N", title=f"OOS ({time_unit})"),
                     color=alt.Color(f"{metric_col}:Q", title=f"{metric_col}"),
-                    tooltip=["config:N", alt.Tooltip(f"{metric_col}:Q", format=".3f"), "splits:N", "mode:N"]
+                    tooltip=[
+                        "config:N",
+                        alt.Tooltip(f"{metric_col}:Q", format=".3f"),
+                        "splits:N",
+                        "Mode:N",
+                    ],
                 )
-                .facet(column="Mode")
                 .properties(height=320)
             )
+    
+            modes_unique = hm["Mode"].unique().tolist()
+            if len(modes_unique) > 1:
+                ch = base.facet(column=alt.Column("Mode:N", title="Mode"))
+            else:
+                ch = base.properties(title=f"Mode: {modes_unique[0]}")
+    
             st.altair_chart(ch, use_container_width=True)
         else:
             st.info("Nessun dato per la heatmap.")
+
 
     with tab_downloads:
         st.subheader("⬇️ Download risultati / OOS concatenati")
@@ -490,3 +507,4 @@ else:
             )
         else:
             st.info("Nessun OOS da scaricare.")
+
