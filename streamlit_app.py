@@ -47,7 +47,8 @@ with st.sidebar:
     modes_sel    = st.multiselect("Modalità", ["sliding","expanding"], default=["sliding"])    
     purge_days   = st.number_input("Embargo/Purge (giorni)", 0, 365, 1, 1)
     max_configs  = st.number_input("Limite configurazioni", 1, 2000, 120, 1)
-    topN_plot    = st.number_input("Top N da plottare", 1, 30, 5, 1)
+    line_opacity = st.slider("Opacità curve bundle", 0.05, 1.0, 0.25, 0.05)
+show_band    = st.checkbox("Evidenzia banda robustezza (p10–p90) e mediana", True)
 
     st.divider()
     st.header("📏 Metrica di selezione/valutazione")
@@ -119,6 +120,13 @@ def df_mdd_cols(df: pd.DataFrame) -> pd.Series:
     peak = eq.cummax()
     dd = (peak - eq) / peak
     return dd.max(axis=0)
+
+# Build equity curve from sparse OOS (flat between OOS chunks, NaN before first OOS)
+
+def equity_curve_from_oos(oos: pd.Series) -> pd.Series:
+    eq = oos.fillna(0.0).cumsum()
+    seen = oos.notna().cumsum() > 0
+    return eq.where(seen)
 
 # segment stats (mean, std, downside std)
 
@@ -391,76 +399,73 @@ for k, (is_amt, oos_amt, mode) in enumerate(grid):
 progress.empty()
 
 # ============================
-# Tabbed results
+# Tabbed results (Bundle-first view)
 # ============================
 
 if len(bundle_rows) == 0:
     st.warning("Nessuna configurazione valida. Controlla range date, IS/OOS e unità.")
 else:
-    df_bundle = pd.DataFrame(bundle_rows)
+    df_bundle = pd.DataFrame(bundle_rows).reset_index(drop=True)
 
-    # sort by selected metric (note: for Max Drawdown, smaller is better)
-    sort_col = metric if metric in df_bundle.columns else "Sharpe"
-    ascending = True if sort_col == "Max Drawdown" else False
-    df_bundle = df_bundle.sort_values(by=sort_col, ascending=ascending).reset_index(drop=True)
+    tab_bundle, tab_heatmap, tab_metrics, tab_downloads = st.tabs(["Bundle", "Heatmap", "Metriche & tabella", "Download"]) 
 
-    tab_rank, tab_equity, tab_heatmap, tab_downloads = st.tabs(["Classifica", "Equity TopN", "Heatmap", "Download"])
-
-    with tab_rank:
-        st.subheader("📊 Classifica configurazioni (serie OOS concatenata)")
-        st.dataframe(df_bundle, use_container_width=True)
-
-        # Quick metrics for the top config
-        if not df_bundle.empty:
-            top_row = df_bundle.iloc[0]
-            c1, c2, c3, c4, c5, c6 = st.columns(6)
-            c1.metric("Sharpe", f"{top_row['Sharpe']:.3f}" if np.isfinite(top_row['Sharpe']) else "-∞")
-            c2.metric("Sortino", f"{top_row['Sortino']:.3f}" if np.isfinite(top_row['Sortino']) else "-∞")
-            c3.metric("Mean", f"{top_row['Mean return']:.5f}")
-            c4.metric("MDD", f"{top_row['Max Drawdown']:.2%}" if pd.notna(top_row['Max Drawdown']) else "na")
-            c5.metric("CAGR", f"{top_row['CAGR']:.2%}" if pd.notna(top_row['CAGR']) else "na")
-            c6.metric("Hit-rate", f"{top_row['Hit-rate']:.1%}" if pd.notna(top_row['Hit-rate']) else "na")
-
-    with tab_equity:
-        st.subheader("📈 PnL cumulato — Top configurazioni (OOS concatenati)")
-        if not df_bundle.empty:
-            top_keys = df_bundle["config"].head(int(topN_plot)).tolist()
-            eq_df = pd.DataFrame({k: equities[k] for k in top_keys})
+    with tab_bundle:
+        st.subheader("📈 Bundle delle equity OOS concatenati — tutte le configurazioni")
+        # Build equity curves for all configs
+        if len(oos_concat_map) == 0:
+            st.info("Nessuna equity da plottare.")
+        else:
+            eq_all = {k: equity_curve_from_oos(v) for k, v in oos_concat_map.items()}
+            eq_df = pd.DataFrame(eq_all)
             eq_long = (
                 eq_df.reset_index()
                      .melt("index", var_name="config", value_name="equity")
                      .rename(columns={"index": "date"})
             )
-            chart = (
-                alt.Chart(eq_long)
-                .mark_line()
+
+            # Robustness band (p10–p90) and median across configs per date
+            band = None
+            if show_band and not eq_df.empty:
+                p10 = eq_df.quantile(0.10, axis=1, interpolation="linear")
+                p50 = eq_df.quantile(0.50, axis=1, interpolation="linear")
+                p90 = eq_df.quantile(0.90, axis=1, interpolation="linear")
+                band_df = pd.DataFrame({"date": eq_df.index, "p10": p10.values, "p50": p50.values, "p90": p90.values}).dropna()
+                band = (
+                    alt.Chart(band_df)
+                    .mark_area(opacity=0.25)
+                    .encode(x="date:T", y="p10:Q", y2="p90:Q")
+                ) + (
+                    alt.Chart(band_df)
+                    .mark_line()
+                    .encode(x="date:T", y="p50:Q")
+                )
+
+            lines = (
+                alt.Chart(eq_long.dropna())
+                .mark_line(opacity=float(line_opacity))
                 .encode(
                     x=alt.X("date:T", title="Data"),
                     y=alt.Y("equity:Q", title="PnL cumulato (solo OOS concatenati)", scale=alt.Scale(zero=True)),
-                    color=alt.Color("config:N", title="Configurazione"),
+                    color=alt.Color("config:N", legend=None),
                     tooltip=["date:T", "config:N", alt.Tooltip("equity:Q", format=".4f")]
                 )
-                .properties(height=360)
+                .properties(height=420)
                 .interactive()
             )
+
+            chart = (band + lines) if band is not None else lines
             st.altair_chart(chart, use_container_width=True)
-        else:
-            st.info("Nessuna configurazione da plottare.")
 
     with tab_heatmap:
         st.subheader("🗺️ Heatmap della metrica sulla griglia (per modalità selezionata)")
         if not df_bundle.empty:
-            # Build compact df for heatmap
+            # build a compact df for heatmap
             hm = df_bundle.copy()
             hm["IS"] = [x.split("|")[0].split("=")[1].strip() for x in hm["config"]]
             hm["OOS"] = [x.split("|")[1].split("=")[1].strip() for x in hm["config"]]
             hm["Mode"] = hm["mode"].astype(str)
-    
             metric_col = metric if metric in hm.columns else "Sharpe"
-    
-            # Ensure metric is numeric for color=...:Q
             hm[metric_col] = pd.to_numeric(hm[metric_col], errors="coerce")
-    
             base = (
                 alt.Chart(hm)
                 .mark_rect()
@@ -468,26 +473,41 @@ else:
                     x=alt.X("IS:N", title=f"IS ({time_unit})"),
                     y=alt.Y("OOS:N", title=f"OOS ({time_unit})"),
                     color=alt.Color(f"{metric_col}:Q", title=f"{metric_col}"),
-                    tooltip=[
-                        "config:N",
-                        alt.Tooltip(f"{metric_col}:Q", format=".3f"),
-                        "splits:N",
-                        "Mode:N",
-                    ],
+                    tooltip=["config:N", alt.Tooltip(f"{metric_col}:Q", format=".3f"), "splits:N", "Mode:N"],
                 )
                 .properties(height=320)
             )
-    
             modes_unique = hm["Mode"].unique().tolist()
             if len(modes_unique) > 1:
                 ch = base.facet(column=alt.Column("Mode:N", title="Mode"))
             else:
                 ch = base.properties(title=f"Mode: {modes_unique[0]}")
-    
             st.altair_chart(ch, use_container_width=True)
         else:
             st.info("Nessun dato per la heatmap.")
 
+    with tab_metrics:
+        st.subheader("Distribuzione metrica sul bundle")
+        if not df_bundle.empty:
+            metric_col = metric if metric in df_bundle.columns else "Sharpe"
+            vals = pd.to_numeric(df_bundle[metric_col], errors="coerce").dropna()
+            if not vals.empty:
+                p5, p25, p50, p75, p95 = np.percentile(vals, [5,25,50,75,95])
+                c1, c2, c3, c4, c5 = st.columns(5)
+                c1.metric("p5", f"{p5:.3f}")
+                c2.metric("p25", f"{p25:.3f}")
+                c3.metric("median", f"{p50:.3f}")
+                c4.metric("p75", f"{p75:.3f}")
+                c5.metric("p95", f"{p95:.3f}")
+                ch = (
+                    alt.Chart(df_bundle[[metric_col]])
+                    .mark_bar()
+                    .encode(alt.X(f"{metric_col}:Q", bin=alt.Bin(maxbins=40)), y="count()")
+                    .properties(height=300)
+                )
+                st.altair_chart(ch, use_container_width=True)
+        st.subheader("Tabella configurazioni (non ordinata per metrica)")
+        st.dataframe(df_bundle, use_container_width=True)
 
     with tab_downloads:
         st.subheader("⬇️ Download risultati / OOS concatenati")
@@ -498,13 +518,12 @@ else:
             mime="text/csv"
         )
         if not df_bundle.empty:
-            out = pd.DataFrame({k: oos_concat_map[k] for k in df_bundle["config"].head(int(topN_plot))})
+            out = pd.DataFrame({k: oos_concat_map[k] for k in df_bundle["config"]})
             st.download_button(
-                "Scarica OOS concatenati TopN (CSV)",
+                "Scarica OOS concatenati (tutte le configurazioni, CSV)",
                 data=out.to_csv(),
-                file_name="wfb_oos_concat_topN.csv",
+                file_name="wfb_oos_concat_all.csv",
                 mime="text/csv"
             )
         else:
             st.info("Nessun OOS da scaricare.")
-
