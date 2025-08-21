@@ -48,7 +48,9 @@ with st.sidebar:
     purge_days   = st.number_input("Embargo/Purge (giorni)", 0, 365, 1, 1)
     max_configs  = st.number_input("Limite configurazioni", 1, 2000, 120, 1)
     line_opacity = st.slider("Opacità curve bundle", 0.05, 1.0, 0.25, 0.05)
-show_band    = st.checkbox("Evidenzia banda robustezza (p10–p90) e mediana", True)
+    show_band    = st.checkbox("Evidenzia banda robustezza (p10–p90) e mediana", True)
+    show_legend  = st.checkbox("Mostra legenda configurazioni", False)
+    hover_focus  = st.checkbox("Evidenzia config al passaggio del mouse", True)
 
     st.divider()
     st.header("📏 Metrica di selezione/valutazione")
@@ -438,20 +440,38 @@ else:
                     alt.Chart(band_df)
                     .mark_line()
                     .encode(x="date:T", y="p50:Q")
-                )
+                )            base_lines = alt.Chart(eq_long.dropna())
 
-            lines = (
-                alt.Chart(eq_long.dropna())
-                .mark_line(opacity=float(line_opacity))
-                .encode(
-                    x=alt.X("date:T", title="Data"),
-                    y=alt.Y("equity:Q", title="PnL cumulato (solo OOS concatenati)", scale=alt.Scale(zero=True)),
-                    color=alt.Color("config:N", legend=None),
-                    tooltip=["date:T", "config:N", alt.Tooltip("equity:Q", format=".4f")]
+            if hover_focus:
+                sel = alt.selection_point(on="mouseover", fields=["config"], nearest=True, empty="none")
+                lines = (
+                    base_lines
+                    .mark_line()
+                    .encode(
+                        x=alt.X("date:T", title="Data"),
+                        y=alt.Y("equity:Q", title="PnL cumulato (solo OOS concatenati)", scale=alt.Scale(zero=True)),
+                        color=alt.Color("config:N", legend=alt.Legend() if show_legend else None),
+                        opacity=alt.condition(sel, alt.value(1.0), alt.value(float(line_opacity))),
+                        size=alt.condition(sel, alt.value(2.0), alt.value(1.0)),
+                        tooltip=["date:T", "config:N", alt.Tooltip("equity:Q", format=".4f")],
+                    )
+                    .add_params(sel)
+                    .properties(height=420)
+                    .interactive()
                 )
-                .properties(height=420)
-                .interactive()
-            )
+            else:
+                lines = (
+                    base_lines
+                    .mark_line(opacity=float(line_opacity))
+                    .encode(
+                        x=alt.X("date:T", title="Data"),
+                        y=alt.Y("equity:Q", title="PnL cumulato (solo OOS concatenati)", scale=alt.Scale(zero=True)),
+                        color=alt.Color("config:N", legend=alt.Legend() if show_legend else None),
+                        tooltip=["date:T", "config:N", alt.Tooltip("equity:Q", format=".4f")],
+                    )
+                    .properties(height=420)
+                    .interactive()
+                )
 
             chart = (band + lines) if band is not None else lines
             st.altair_chart(chart, use_container_width=True)
