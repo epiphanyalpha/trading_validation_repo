@@ -72,7 +72,7 @@ L'idea è semplice ma potente:
 📊 Qui sotto uno schema visuale del concetto di Walk-Forward:
 """
 )
-render_walkforward_schema()
+#render_walkforward_schema()
 st.divider()
 # ============================
 # Parte 2 — Core funzioni + Sidebar + Caricamento + Bundle
@@ -631,4 +631,5 @@ with tab_downloads:
 # Piccolo separatore estetico finale
 st.markdown("---")
 st.caption("© Walk-Forward Bundle Validator — built for clarity & robustness.")
+
 
