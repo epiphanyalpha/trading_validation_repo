@@ -354,60 +354,71 @@ df_bundle = pd.DataFrame(bundle_rows).reset_index(drop=True)
 tab_bundle, tab_heatmap, tab_metrics, tab_downloads = st.tabs(["Bundle", "Heatmap", "Metriche", "Download"])
 
 with tab_bundle:
-    st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.subheader("📈 Bundle OOS concatenati — nuvola + banda robustezza")
-    # Equity per tutte le configurazioni
-    eq_all = {k: equity_curve_from_oos(v) for k, v in oos_concat_map.items()}
-    eq_df = pd.DataFrame(eq_all)
+    st.subheader("📈 Bundle OOS concatenati (light)")
 
-    # Resample e downsample SOLO per display
-    eq_df = resample_for_display(eq_df, display_freq)
-    eq_df = decimate_by_stride(eq_df, int(max_points))
+    if len(oos_concat_map) == 0:
+        st.info("Nessuna equity da plottare.")
+    else:
+        # 1) costruzione equity
+        eq_all = {k: equity_curve_from_oos(v) for k, v in oos_concat_map.items()}
+        eq_df = pd.DataFrame(eq_all)
 
-    # Banda robustezza
-    band = None
-    if show_band and not eq_df.empty:
+        # 2) downsample max N punti (solo display)
+        Nmax = 2000
+        if len(eq_df) > Nmax:
+            idx = np.linspace(0, len(eq_df) - 1, Nmax, dtype=int)
+            eq_df = eq_df.iloc[idx]
+
+        # 3) calcolo banda robustezza
         p10 = eq_df.quantile(0.10, axis=1, interpolation="linear")
         p50 = eq_df.quantile(0.50, axis=1, interpolation="linear")
         p90 = eq_df.quantile(0.90, axis=1, interpolation="linear")
-        band_df = pd.DataFrame({"date": eq_df.index, "p10": p10.values, "p50": p50.values, "p90": p90.values}).dropna()
+        band_df = pd.DataFrame({
+            "date": eq_df.index,
+            "p10": p10,
+            "p50": p50,
+            "p90": p90
+        }).dropna()
+
+        # 4) banda robustezza (area + mediana)
         band = (
-            alt.Chart(band_df.reset_index(drop=True))
-            .mark_area(opacity=0.25)
-            .encode(x=alt.X("date:T", title="Data"), y="p10:Q", y2="p90:Q")
+            alt.Chart(band_df.reset_index())
+            .mark_area(opacity=0.25, color="#4C78A8")
+            .encode(x="date:T", y="p10:Q", y2="p90:Q")
         ) + (
-            alt.Chart(band_df.reset_index(drop=True))
-            .mark_line(size=2)
+            alt.Chart(band_df.reset_index())
+            .mark_line(color="white")
             .encode(x="date:T", y="p50:Q")
         )
 
-    # Nuvola: tutte le linee, colore neutro, niente tooltip/hover
-    cloud = (
-        alt.Chart(
-            eq_df.reset_index().melt("index", var_name="config", value_name="equity")
-                 .rename(columns={"index": "date"})
-        )
-        .mark_line(opacity=float(cloud_alpha))
-        .encode(
-            x=alt.X("date:T", title="Data"),
-            y=alt.Y("equity:Q", title="PnL cumulato (solo OOS concatenati)", scale=alt.Scale(zero=True)),
-        )
-    )
-
-    # Overlay: evidenzia UNA configurazione (selezionabile)
-    cfg_list = ["(nessuna)"] + list(eq_df.columns)
-    chosen = st.selectbox("Evidenzia configurazione", cfg_list, index=0)
-    highlight = None
-    if chosen != "(nessuna)" and chosen in eq_df.columns:
-        highlight = (
-            alt.Chart(eq_df[[chosen]].reset_index().rename(columns={"index":"date", chosen:"equity"}))
-            .mark_line(size=3)
-            .encode(x="date:T", y=alt.Y("equity:Q", scale=alt.Scale(zero=True)))
+        # 5) nuvola di tutte le linee
+        cloud = (
+            alt.Chart(eq_df.reset_index().melt("index", var_name="config", value_name="equity"))
+            .mark_line(opacity=0.05, color="gray")
+            .encode(x="index:T", y="equity:Q")
         )
 
-    chart = (band + cloud + (highlight if highlight else alt.Layer())) if band is not None else (cloud + (highlight if highlight else alt.Layer()))
-    st.altair_chart(chart.properties(height=460), use_container_width=True)
-    st.markdown('</div>', unsafe_allow_html=True)
+        # 6) Overlay: evidenzia UNA configurazione (selezionabile)
+        cfg_list = ["(nessuna)"] + list(eq_df.columns)
+        chosen = st.selectbox("Evidenzia configurazione", cfg_list, index=0)
+
+        highlight = None
+        if chosen != "(nessuna)" and chosen in eq_df.columns:
+            highlight = (
+                alt.Chart(eq_df[[chosen]].reset_index().rename(columns={"index": "date", chosen: "equity"}))
+                .mark_line(size=3, color="#FFD166")
+                .encode(x="date:T", y=alt.Y("equity:Q", scale=alt.Scale(zero=True)))
+            )
+
+        # 7) composizione finale
+        chart = band + cloud
+        if highlight is not None:
+            chart = chart + highlight
+
+        st.altair_chart(chart.properties(height=460), use_container_width=True)
+        st.markdown('</div>', unsafe_allow_html=True)
+
+
 
 # ============================
 # TAB 2 — Heatmap (leggera)
@@ -482,3 +493,4 @@ with tab_downloads:
     )
     st.markdown('<span class="small">I CSV sono in formato largo: colonne=Configurazioni, righe=timestamp.</span>', unsafe_allow_html=True)
     st.markdown('</div>', unsafe_allow_html=True)
+
