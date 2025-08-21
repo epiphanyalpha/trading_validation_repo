@@ -349,7 +349,7 @@ if len(bundle_rows) == 0:
 df_bundle = pd.DataFrame(bundle_rows).reset_index(drop=True)
 
 # ============================
-# TAB 1 — Bundle Plot (clean & stable)
+# TAB 1 — Bundle Plot (semplice e robusto)
 # ============================
 tab_bundle, tab_heatmap, tab_metrics, tab_downloads = st.tabs(
     ["Bundle", "Heatmap", "Metriche", "Download"]
@@ -365,30 +365,30 @@ with tab_bundle:
         eq_all = {k: equity_curve_from_oos(v) for k, v in oos_concat_map.items()}
         eq_df = pd.DataFrame(eq_all)
 
+        # Fill NaN per evitare buchi (così non sparisce mai nulla)
+        eq_df = eq_df.fillna(method="ffill").fillna(0)
+
         # 2) downsample max N punti (solo display)
         Nmax = 2000
         if len(eq_df) > Nmax:
             idx = np.linspace(0, len(eq_df) - 1, Nmax, dtype=int)
             eq_df = eq_df.iloc[idx]
 
-        # 3) calcolo mediana
-        median_curve = eq_df.median(axis=1)
-
-        # 4) tutte le linee in grigio leggero
+        # 3) Nuvola di tutte le linee
         cloud = (
             alt.Chart(eq_df.reset_index().melt("index", var_name="config", value_name="equity"))
             .mark_line(opacity=0.15, color="gray")
             .encode(x="index:T", y="equity:Q")
         )
 
-        # 5) linea mediana in bianco
-        median_line = (
-            alt.Chart(median_curve.reset_index().rename(columns={"index": "date", 0: "equity"}))
+        # 4) Mediana sempre visibile
+        median_curve = (
+            alt.Chart(eq_df.median(axis=1).reset_index().rename(columns={"index": "date", 0: "equity"}))
             .mark_line(color="white", size=2)
             .encode(x="date:T", y="equity:Q")
         )
 
-        # 6) Overlay opzionale: evidenzia UNA configurazione
+        # 5) Overlay: evidenzia UNA configurazione
         cfg_list = ["(nessuna)"] + list(eq_df.columns)
         chosen = st.selectbox("Evidenzia configurazione", cfg_list, index=0)
 
@@ -400,8 +400,8 @@ with tab_bundle:
                 .encode(x="date:T", y="equity:Q")
             )
 
-        # 7) composizione finale
-        chart = cloud + median_line
+        # 6) Composizione finale
+        chart = cloud + median_curve
         if highlight is not None:
             chart = chart + highlight
 
@@ -483,5 +483,6 @@ with tab_downloads:
     )
     st.markdown('<span class="small">I CSV sono in formato largo: colonne=Configurazioni, righe=timestamp.</span>', unsafe_allow_html=True)
     st.markdown('</div>', unsafe_allow_html=True)
+
 
 
