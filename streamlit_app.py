@@ -349,7 +349,7 @@ if len(bundle_rows) == 0:
 df_bundle = pd.DataFrame(bundle_rows).reset_index(drop=True)
 
 # ============================
-# TAB 1 — Bundle Plot (semplice e robusto)
+# TAB 1 — Bundle Plot (stile demo)
 # ============================
 tab_bundle, tab_heatmap, tab_metrics, tab_downloads = st.tabs(
     ["Bundle", "Heatmap", "Metriche", "Download"]
@@ -363,49 +363,29 @@ with tab_bundle:
     else:
         # 1) costruzione equity
         eq_all = {k: equity_curve_from_oos(v) for k, v in oos_concat_map.items()}
-        eq_df = pd.DataFrame(eq_all)
+        eq_df = pd.DataFrame(eq_all).ffill().fillna(0)
 
-        # Fill NaN per evitare buchi (così non sparisce mai nulla)
-        eq_df = eq_df.fillna(method="ffill").fillna(0)
-
-        # 2) downsample max N punti (solo display)
+        # 2) downsample solo per display (se troppo lungo)
         Nmax = 2000
         if len(eq_df) > Nmax:
             idx = np.linspace(0, len(eq_df) - 1, Nmax, dtype=int)
             eq_df = eq_df.iloc[idx]
 
-        # 3) Nuvola di tutte le linee
-        cloud = (
-            alt.Chart(eq_df.reset_index().melt("index", var_name="config", value_name="equity"))
-            .mark_line(opacity=0.15, color="gray")
-            .encode(x="index:T", y="equity:Q")
-        )
+        # 3) melt in long format per Altair
+        plot_df = eq_df.reset_index().melt("index", var_name="config", value_name="equity")
 
-        # 4) Mediana sempre visibile
-        median_curve = (
-            alt.Chart(eq_df.median(axis=1).reset_index().rename(columns={"index": "date", 0: "equity"}))
-            .mark_line(color="white", size=2)
-            .encode(x="date:T", y="equity:Q")
-        )
-
-        # 5) Overlay: evidenzia UNA configurazione
-        cfg_list = ["(nessuna)"] + list(eq_df.columns)
-        chosen = st.selectbox("Evidenzia configurazione", cfg_list, index=0)
-
-        highlight = None
-        if chosen != "(nessuna)" and chosen in eq_df.columns:
-            highlight = (
-                alt.Chart(eq_df[[chosen]].reset_index().rename(columns={"index": "date", chosen: "equity"}))
-                .mark_line(size=3, color="#FFD166")
-                .encode(x="date:T", y="equity:Q")
+        # 4) linea di tutte le concatenazioni (multicolore)
+        chart = (
+            alt.Chart(plot_df)
+            .mark_line(strokeWidth=2)  # tutte uguali, spessore costante
+            .encode(
+                x=alt.X("index:T", title="Date"),
+                y=alt.Y("equity:Q", title="Cumulative Return"),
+                color=alt.Color("config:N", legend=None)  # colore diverso per ciascuna
             )
+        )
 
-        # 6) Composizione finale
-        chart = cloud + median_curve
-        if highlight is not None:
-            chart = chart + highlight
-
-        st.altair_chart(chart.properties(height=460), use_container_width=True)
+        st.altair_chart(chart.properties(height=500), use_container_width=True)
 
 
 
@@ -483,6 +463,7 @@ with tab_downloads:
     )
     st.markdown('<span class="small">I CSV sono in formato largo: colonne=Configurazioni, righe=timestamp.</span>', unsafe_allow_html=True)
     st.markdown('</div>', unsafe_allow_html=True)
+
 
 
 
