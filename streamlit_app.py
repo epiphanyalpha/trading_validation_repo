@@ -69,7 +69,7 @@ L'idea è semplice ma potente:
 - Si concatenano i rendimenti **fuori-campione (OOS)** di ciascuna configurazione.
 - Si confrontano le equity line risultanti: se molte configurazioni sono stabili → strategia robusta.
 
-📊 Qui sotto uno schema visuale del concetto di Walk-Forward:
+
 """
 )
 #render_walkforward_schema()
@@ -631,5 +631,6 @@ with tab_downloads:
 # Piccolo separatore estetico finale
 st.markdown("---")
 st.caption("© Walk-Forward Bundle Validator — built for clarity & robustness.")
+
 
 
