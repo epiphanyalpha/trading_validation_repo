@@ -1,14 +1,15 @@
 # ============================
 # streamlit_app.py
 # ============================
-
 import streamlit as st
 import pandas as pd
 import numpy as np
 import altair as alt
-
 from pathlib import Path
 import json
+import re  # <— AGGIUNGI QUESTA
+
+
 
 st.set_page_config(
     page_title="Walk-Forward Bundle Validator",
@@ -630,3 +631,4 @@ with tab_downloads:
 # Piccolo separatore estetico finale
 st.markdown("---")
 st.caption("© Walk-Forward Bundle Validator — built for clarity & robustness.")
+
