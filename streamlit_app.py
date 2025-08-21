@@ -1,9 +1,9 @@
-# streamlit_app.py — Walk-Forward Bundle (v4-ultralight)
-# Obiettivo: estetica "wow", massima leggerezza, messaggio chiaro sulla robustezza del bundle.
-# - Tutte le linee OOS concatenate (nuvola grigio trasparente)
-# - Banda p10–p90 + mediana (calcolate lato Pandas)
-# - Evidenzia UNA configurazione (overlay)
-# - Downsample duro (max_points) + resample display (settimanale/mensile)
+# streamlit_app.py — Walk-Forward Bundle (v4-ultralight + intro educativa + schema WF + bundle stile demo)
+# Obiettivo: estetica "wow", leggerezza, messaggio chiaro sulla robustezza del bundle.
+# - Sezione educativa all’inizio (testo + expander)
+# - Mini-diagramma IS/Embargo/OOS (rettangoli) vicino all’inizio
+# - Tutte le linee OOS concatenate in stile demo (multicolore, stesso spessore)
+# - Downsample display (max_points)
 # - Embargo corretto, IS/OOS in giorni/mesi/anni, MDD vettoriale
 # - CSV loader robusto, progress bar, heatmap leggera, metrica distribuzione
 
@@ -23,15 +23,12 @@ st.set_page_config(page_title="Walk-Forward Bundle — v4 ultralight", page_icon
 # Minimal glassy look & feel
 st.markdown("""
 <style>
-/* Base */
 html, body, [class^="css"]  {
   font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, "Helvetica Neue", Arial, "Noto Sans", "Apple Color Emoji", "Segoe UI Emoji";
 }
 section[data-testid="stSidebar"] { border-right: 1px solid rgba(0,0,0,.05); }
 .block-container { padding-top: 1.2rem; padding-bottom: 2rem; max-width: 1400px; }
 h1, h2, h3 { letter-spacing: 0.2px; }
-
-/* Cards */
 .card {
   background: linear-gradient(180deg, rgba(255,255,255,.75), rgba(255,255,255,.60));
   backdrop-filter: blur(6px);
@@ -41,17 +38,41 @@ h1, h2, h3 { letter-spacing: 0.2px; }
   box-shadow: 0 8px 24px rgba(0,0,0,.06);
   margin-bottom: 1rem;
 }
-
-/* Subtle captions */
 .small { font-size: 12px; color: rgba(0,0,0,.55); }
-
-/* Hide footer watermark for cleanliness */
 footer { visibility: hidden; }
 </style>
 """, unsafe_allow_html=True)
 
 st.markdown("### 🚶‍♂️📦 Walk-Forward Bundle — **robustezza visiva, zero fronzoli**")
 st.caption("Stress test del modello al variare di IS/OOS/metriche. Focus: stabilità del **bundle** (non scegliere un vincitore).")
+
+# ============================
+# Sezione educativa (ALL’INIZIO)
+# ============================
+st.markdown("## 🧠 Che cos’è il Walk-Forward Bundle?")
+st.markdown(
+    """
+Il **Walk-Forward** è una procedura di *ri-validazione nel tempo*: per ogni finestra **IS** (*in-sample*)
+selezioniamo la strategia migliore secondo una metrica e la applichiamo alla finestra **OOS** (*out-of-sample*) successiva.
+Poi **avanziamo di uno step pari a OOS** (gli OOS non si sovrappongono) e ripetiamo.
+
+Il **Walk-Forward Bundle** non cerca un “vincitore” assoluto: esegue **molte configurazioni** (IS/OOS/metriche/modalità)
+e per **ciascuna** concatena **solo i rendimenti OOS** in un’unica serie. L’obiettivo è valutare la **stabilità**
+sotto variazione dei parametri (robustezza).
+"""
+)
+with st.expander("Dettagli operativi →", expanded=False):
+    st.markdown(
+        """
+1. **Griglia configurazioni**: combinazioni di (IS, OOS, modalità `sliding/expanding`, metrica).
+2. **Per ogni split**:
+   - **Selezione**: dentro l’IS scegliamo la strategia migliore secondo la metrica (es. Sharpe).
+   - **Test**: applichiamo **solo quella** in **OOS** e salviamo **solo** i rendimenti OOS.
+3. **Concatenazione**: uniamo tutti gli OOS → **una serie OOS** per configurazione.
+4. **Valutazione**: metriche sulla serie OOS concatenata (Sharpe, Sortino, MDD, CAGR, Hit-rate).
+5. **Bundle plot**: mostriamo **tutte** le serie OOS concatenate (una linea per configurazione).
+        """
+    )
 
 # ============================
 # Sidebar — Dati & Griglia
@@ -77,10 +98,10 @@ with st.sidebar:
 
     st.divider()
     st.header("🎨 Grafico (ultralight)")
-    show_band    = st.checkbox("Banda p10–p90 + mediana", True)
+    show_band    = st.checkbox("Banda p10–p90 + mediana", True)  # (non usata nel bundle demo-style)
     display_freq = st.selectbox("Campionamento display", ["nessuno", "settimanale", "mensile"], index=0)
     max_points   = st.number_input("Max punti temporali (display)", 300, 20000, 2000, 100)
-    cloud_alpha  = st.slider("Opacità nuvola bundle", 0.02, 0.5, 0.08, 0.01)
+    cloud_alpha  = st.slider("Opacità nuvola bundle", 0.02, 0.5, 0.08, 0.01)  # (non usata nel bundle demo-style)
 
     st.divider()
     st.header("📏 Metrica selezione")
@@ -286,7 +307,64 @@ if 'ann_initialized' not in st.session_state:
         st.toast(f"Suggerimento: ann={ann_default} dalla frequenza indice")
 
 # ============================
-# Preview — PnL cumulato (tutte le strategie)
+# (Vicino all’inizio) Mini-diagramma IS/Embargo/OOS
+# ============================
+def _wf_add_offset(dt, unit, amount):
+    if unit == "giorni": return dt + pd.DateOffset(days=int(amount))
+    if unit == "mesi":   return dt + pd.DateOffset(months=int(amount))
+    if unit == "anni":   return dt + pd.DateOffset(months=int(round(float(amount)*12)))
+    raise ValueError
+
+def _first_number(txt: str, default: float):
+    parts = [p for p in re.split(r"[\s,;]+", str(txt).strip()) if p]
+    try: return float(parts[0])
+    except: return default
+
+def wf_schematic(start_date, time_unit, is_amt, oos_amt, purge_days=1, splits=4):
+    rows = []
+    anchor = max(_wf_add_offset(pd.to_datetime(start_date),
+                                "anni" if time_unit=="anni" else time_unit,
+                                is_amt),
+                 pd.to_datetime(start_date))
+    for k in range(1, splits+1):
+        is_end   = anchor
+        is_start = _wf_add_offset(is_end, time_unit, -is_amt)
+        oos_start= is_end + pd.DateOffset(days=int(purge_days))
+        oos_end  = _wf_add_offset(oos_start, time_unit, oos_amt)
+        rows += [
+            {"split": k, "phase": "IS",      "start": is_start, "end": is_end},
+            {"split": k, "phase": "Embargo", "start": is_end,   "end": oos_start},
+            {"split": k, "phase": "OOS",     "start": oos_start,"end": oos_end},
+        ]
+        anchor = _wf_add_offset(anchor, time_unit, oos_amt)
+    df = pd.DataFrame(rows)
+    return (
+        alt.Chart(df).mark_bar()
+        .encode(
+            x=alt.X("start:T", title="Tempo"), x2="end:T",
+            y=alt.Y("split:O", title="Split"),
+            color=alt.Color("phase:N",
+                scale=alt.Scale(domain=["IS","Embargo","OOS"],
+                                range=["#27AE60","#CFCFCF","#E74C3C"]),
+                legend=alt.Legend(title=None, orient="top")),
+            tooltip=["phase:N","start:T","end:T"]
+        ).properties(height=140)
+    )
+
+st.markdown("#### Schema visivo: IS → Embargo → OOS (step = OOS)")
+st.altair_chart(
+    wf_schematic(start_date=start_date,
+                 time_unit=time_unit,
+                 is_amt=_first_number(is_txt, 3.0),
+                 oos_amt=_first_number(oos_txt, 63.0),
+                 purge_days=int(purge_days),
+                 splits=4),
+    use_container_width=True
+)
+st.caption("Mostriamo solo le prime 4 finestre per illustrare il meccanismo. Il bundle completo usa l’intera serie.")
+
+# ============================
+# Anteprima — PnL cumulato (tutte le strategie)
 # ============================
 st.markdown('<div class="card">', unsafe_allow_html=True)
 st.subheader("👀 Anteprima — PnL cumulato (tutte le strategie)")
@@ -349,46 +427,49 @@ if len(bundle_rows) == 0:
 df_bundle = pd.DataFrame(bundle_rows).reset_index(drop=True)
 
 # ============================
-# TAB 1 — Bundle Plot (stile demo)
+# TABs
 # ============================
 tab_bundle, tab_heatmap, tab_metrics, tab_downloads = st.tabs(
     ["Bundle", "Heatmap", "Metriche", "Download"]
 )
 
+# ============================
+# TAB 1 — Bundle Plot (STILE DEMO: multicolore, spessore costante)
+# ============================
 with tab_bundle:
-    st.subheader("📈 Bundle OOS concatenati")
+    st.subheader("📈 Bundle OOS concatenati — stile demo")
 
     if len(oos_concat_map) == 0:
         st.info("Nessuna equity da plottare.")
     else:
-        # 1) costruzione equity
+        # 1) equity per tutte le configurazioni
         eq_all = {k: equity_curve_from_oos(v) for k, v in oos_concat_map.items()}
-        eq_df = pd.DataFrame(eq_all).ffill().fillna(0)
+        eq_df = pd.DataFrame(eq_all)
 
-        # 2) downsample solo per display (se troppo lungo)
-        Nmax = 2000
-        if len(eq_df) > Nmax:
-            idx = np.linspace(0, len(eq_df) - 1, Nmax, dtype=int)
+        # 2) stabilizzazione: mai grafico vuoto
+        eq_df = eq_df.ffill().fillna(0)
+        eq_df.index.name = "date"
+
+        # 3) resample + downsample (solo display)
+        eq_df = resample_for_display(eq_df, display_freq)
+        if len(eq_df) > int(max_points):
+            idx = np.linspace(0, len(eq_df) - 1, int(max_points), dtype=int)
             eq_df = eq_df.iloc[idx]
 
-        # 3) melt in long format per Altair
-        plot_df = eq_df.reset_index().melt("index", var_name="config", value_name="equity")
-
-        # 4) linea di tutte le concatenazioni (multicolore)
+        # 4) plot stile demo: tutte le linee multicolori, stesso spessore
+        plot_df = eq_df.reset_index().melt("date", var_name="config", value_name="equity")
         chart = (
             alt.Chart(plot_df)
-            .mark_line(strokeWidth=2)  # tutte uguali, spessore costante
+            .mark_line(strokeWidth=2)
             .encode(
-                x=alt.X("index:T", title="Date"),
-                y=alt.Y("equity:Q", title="Cumulative Return"),
-                color=alt.Color("config:N", legend=None)  # colore diverso per ciascuna
+                x=alt.X("date:T", title="Data"),
+                y=alt.Y("equity:Q", title="PnL cumulato (solo OOS concatenati)"),
+                color=alt.Color("config:N", legend=None)
             )
+            .properties(height=480)
+            .interactive()
         )
-
-        st.altair_chart(chart.properties(height=500), use_container_width=True)
-
-
-
+        st.altair_chart(chart, use_container_width=True)
 
 # ============================
 # TAB 2 — Heatmap (leggera)
@@ -409,8 +490,9 @@ with tab_heatmap:
             x=alt.X("IS:N", title=f"IS ({time_unit})"),
             y=alt.Y("OOS:N", title=f"OOS ({time_unit})"),
             color=alt.Color(f"{metric_col}:Q", title=f"{metric_col}"),
+            tooltip=["config:N", alt.Tooltip(f"{metric_col}:Q", format=".3f"), "splits:N", "Mode:N"],
         )
-        .properties(height=300)
+        .properties(height=320)
     )
     modes_unique = hm["Mode"].unique().tolist()
     ch = base.facet(column=alt.Column("Mode:N", title="Mode")) if len(modes_unique) > 1 else base.properties(title=f"Mode: {modes_unique[0]}")
@@ -461,9 +543,5 @@ with tab_downloads:
         file_name="wfb_oos_concat_all.csv",
         mime="text/csv"
     )
-    st.markdown('<span class="small">I CSV sono in formato largo: colonne=Configurazioni, righe=timestamp.</span>', unsafe_allow_html=True)
+    st.markdown('<span class="small">CSV in formato largo: colonne=Configurazioni, righe=timestamp.</span>', unsafe_allow_html=True)
     st.markdown('</div>', unsafe_allow_html=True)
-
-
-
-
