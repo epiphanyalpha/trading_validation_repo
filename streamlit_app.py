@@ -440,7 +440,8 @@ else:
                     alt.Chart(band_df)
                     .mark_line()
                     .encode(x="date:T", y="p50:Q")
-                )            base_lines = alt.Chart(eq_long.dropna())
+                )            
+                base_lines = alt.Chart(eq_long.dropna())
 
             if hover_focus:
                 sel = alt.selection_point(on="mouseover", fields=["config"], nearest=True, empty="none")
@@ -547,3 +548,4 @@ else:
             )
         else:
             st.info("Nessun OOS da scaricare.")
+
