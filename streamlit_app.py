@@ -1,6 +1,7 @@
-# streamlit_app.py — Walk-Forward Bundle (v3)
-# Focus: bundle leggero, banda p10–p90 + mediana, highlight singola config,
-# embargo fix, unità tempo (giorni/mesi/anni), MDD vettoriale.
+# =========================================================
+# streamlit_app.py — Walk-Forward Bundle (v3) - Versione Ottimizzata
+# Focus: Prestazioni, Fluidità, Design
+# =========================================================
 
 import streamlit as st
 import pandas as pd
@@ -9,12 +10,14 @@ import altair as alt
 from itertools import product
 from typing import List, Tuple, Dict
 import re
+import os
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 # ============================
-# Page / Title
+# Configurazione Pagina
 # ============================
-st.set_page_config(page_title="Walk-Forward Bundle (v3)", layout="wide")
-st.title("🚶‍♂️📦 Walk-Forward Bundle — Concatenazione OOS per configurazione (v3)")
+st.set_page_config(page_title="🚀 WFB Bundle v3 — Ottimizzato", layout="wide")
+st.title("🚶‍♂️📦 Walk-Forward Bundle — Concatenazione OOS (v3)")
 
 st.markdown(
     """
@@ -33,15 +36,15 @@ la **banda di robustezza (p10–p90)** con **mediana**.
 # ============================
 with st.sidebar:
     st.header("📦 Dati")
-    n_strategies = st.number_input("N° strategie (demo)", 1, 500, 12, 1)
+    n_strategies = st.number_input("N° strategie (demo)", 1, 500, 100, 1)
     n_periods    = st.number_input("N° periodi (demo)", 200, 100_000, 6000, 100)
     sigma_demo   = st.number_input("Vol demo σ", 0.0001, 0.5, 0.01, 0.0001, format="%.4f")
     seed_demo    = st.number_input("Seed demo", 0, 1_000_000, 42, 1)
-    uploaded     = st.file_uploader("📂 CSV (righe=periodi, colonne=strategie)", type=["csv"])
+    uploaded     = st.file_uploader("📂 Carica CSV (righe=periodi, colonne=strategie)", type=["csv"])
     st.caption("Se non carichi nulla, userò un dataset demo i.i.d. N(0, σ²) dal 2010 in poi.")
 
     st.divider()
-    st.header("🧭 Griglia configurazioni (bundle)")
+    st.header("🧭 Griglia configurazioni")
     start_date   = st.date_input("Data di inizio WFB", value=pd.to_datetime("2013-01-01"))
     time_unit    = st.radio("Unità di misura IS/OOS", ["giorni", "mesi", "anni"], index=0, horizontal=True)
     is_txt       = st.text_input("Lista IS (unità sopra)", value="3,5,8")
@@ -51,16 +54,15 @@ with st.sidebar:
     max_configs  = st.number_input("Limite configurazioni", 1, 2000, 120, 1)
 
     st.divider()
-    st.header("🎨 Grafico bundle")
-    line_opacity = st.slider("Opacità curve", 0.05, 1.0, 0.25, 0.05)
+    st.header("🎨 Grafico & Selezione")
+    line_opacity = st.slider("Opacità curve bundle", 0.05, 1.0, 0.25, 0.05)
     show_band    = st.checkbox("Banda robustezza (p10–p90) + mediana", True)
-    display_freq = st.selectbox("Campionamento grafico (solo display)", ["nessuno", "settimanale", "mensile"], index=0)
+    display_freq = st.selectbox("Campionamento grafico", ["nessuno", "settimanale", "mensile"], index=0)
 
     st.divider()
-    st.header("📏 Metrica di selezione/valutazione")
-    metric = st.selectbox("Metrica", ["Sharpe", "Mean return", "Sortino", "Max Drawdown"])
+    st.header("📏 Metrica")
+    metric = st.selectbox("Metrica di selezione/valutazione", ["Sharpe", "Mean return", "Sortino", "Max Drawdown"])
     ann    = st.number_input("Fattore annualizzazione", 1, 366, 252, 1)
-    st.caption("Suggerimento: 252 ≈ giornaliera trading, 365 ≈ giornaliera calendario.")
 
 # ============================
 # Utils — Dati & Metriche
@@ -171,18 +173,12 @@ def add_offset(dt: pd.Timestamp, unit: str, amount: float) -> pd.Timestamp:
 def build_wf_splits(index: pd.DatetimeIndex, start_date: pd.Timestamp,
                     is_amt: float, oos_amt: float, unit: str,
                     mode: str, purge_days: int) -> List[Tuple[int,int,int,int]]:
-    """
-    Ritorna lista di (is_start, is_end, oos_start, oos_end) come POSIZIONI.
-    step = lunghezza OOS in 'unit' (OOS non sovrapposti).
-    L'embargo esclude il gap sia da IS che da OOS (IS termina all'anchor; OOS parte dopo purge).
-    """
     idx = pd.DatetimeIndex(index).sort_values()
     T = len(idx)
     if T == 0:
         return []
 
-    # primo anchor OOS: >= start_date e con >= is_amt di storia
-    min_is_end = add_offset(idx[0], unit="anni", amount=is_amt) if unit == "anni" else add_offset(idx[0], unit=unit, amount=is_amt)
+    min_is_end = add_offset(idx[0], unit=unit, amount=is_amt)
     first_anchor_date = max(pd.to_datetime(start_date), min_is_end)
     anchor = idx.searchsorted(first_anchor_date, side="left")
     if anchor >= T:
@@ -234,7 +230,7 @@ def build_wf_splits(index: pd.DatetimeIndex, start_date: pd.Timestamp,
 # ============================
 def run_wf_config_concat_oos(data: pd.DataFrame, start_date, is_amt, oos_amt,
                              unit, mode, purge_days, metric, ann):
-    X = data.to_numpy(copy=False)  # (T, N)
+    X = data.to_numpy(copy=False)
     T, N = X.shape
     cs  = np.vstack([np.zeros((1, N)), np.cumsum(X, axis=0)])
     css = np.vstack([np.zeros((1, N)), np.cumsum(X**2, axis=0)])
@@ -294,36 +290,33 @@ def run_wf_config_concat_oos(data: pd.DataFrame, start_date, is_amt, oos_amt,
 # ============================
 if uploaded is not None:
     data = load_csv(uploaded)
-    st.success("✅ File caricato e normalizzato (numeric only, drop all-NaN cols)")
+    st.success("✅ File caricato e normalizzato.")
 else:
     st.info("ℹ️ Nessun file caricato: uso dataset demo i.i.d. N(0, σ²).")
     data = generate_demo(n_strategies, n_periods, sigma_demo, seed_demo)
-    st.caption(f"Demo seed = {seed_demo}")
 
 if 'ann_initialized' not in st.session_state:
     st.session_state['ann_initialized'] = True
     ann_default = infer_ann_from_index(data.index)
     if ann == 252 and ann_default != 252:
-        st.toast(f"Nota: frequenza rilevata → ann={ann_default}")
+        st.toast(f"Nota: frequenza rilevata → ann={ann_default}", icon="⚠️")
 
 # ============================
-# Anteprima — PnL cumulato (tutte le strategie)
+# Anteprima
 # ============================
-st.subheader("Anteprima — PnL cumulato (tutte le strategie)")
-
+st.subheader("Anteprima — PnL cumulato")
 cum = data.cumsum()
 cum_long = (
     cum.reset_index()
        .melt("index", var_name="strategy", value_name="pnl")
        .rename(columns={"index": "date"})
 )
-
 chart_cum = (
     alt.Chart(cum_long)
     .mark_line(opacity=0.85)
     .encode(
         x=alt.X("date:T", title="Data"),
-        y=alt.Y("pnl:Q", title="PnL cumulato (partenza 0)", scale=alt.Scale(zero=True)),
+        y=alt.Y("pnl:Q", title="PnL cumulato", scale=alt.Scale(zero=True)),
         color=alt.Color("strategy:N", title="Strategia", legend=None if data.shape[1] > 25 else alt.Legend()),
     )
     .properties(height=240)
@@ -332,7 +325,7 @@ chart_cum = (
 st.altair_chart(chart_cum, use_container_width=True)
 
 # ============================
-# Costruisci griglia (step = OOS)
+# Costruisci griglia & Esegui il Bundle
 # ============================
 def parse_list_nums(txt: str) -> List[float]:
     return [float(x) for x in re.split(r"[\s,;]+", str(txt).strip()) if x]
@@ -344,111 +337,125 @@ modes    = modes_sel if modes_sel else ["sliding"]
 grid = list(product(IS_list, OOS_list, modes))
 if len(grid) > max_configs:
     grid = grid[:max_configs]
-    st.info(f"🔎 Configurazioni limitate a {max_configs} (aumenta 'Limite configurazioni' per elaborarne di più).")
+    st.info(f"🔎 Configurazioni limitate a {max_configs}.")
 
-st.write(f"**Configurazioni nel bundle:** {len(grid)} — (unità: {time_unit}, step = OOS, OOS non sovrapposti)")
+st.write(f"**Configurazioni nel bundle:** {len(grid)} — (unità: {time_unit}, step = OOS non sovrapposti)")
+
+if st.button("▶️ Esegui Walk-Forward Bundle"):
+    with st.spinner("🚀 Esecuzione in corso... Potrebbe volerci qualche istante..."):
+        bundle_rows = []
+        oos_concat_map: Dict[str, pd.Series] = {}
+        max_workers = os.cpu_count() or 4
+        
+        with ProcessPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(run_wf_config_concat_oos, data, pd.to_datetime(start_date), is_amt, oos_amt, time_unit, mode, int(purge_days), metric, int(ann)): (is_amt, oos_amt, mode)
+                for is_amt, oos_amt, mode in grid
+            }
+            for k, future in enumerate(as_completed(futures)):
+                try:
+                    oos_concat, stats, details = future.result()
+                    key = f"IS={details['is']}{time_unit[0]} | OOS={details['oos']}{time_unit[0]} | {details['mode']}"
+                    oos_concat_map[key] = oos_concat
+                    bundle_rows.append({"config": key, **stats, **details})
+                except Exception as exc:
+                    st.error(f"Errore nell'elaborazione: {exc}")
+                    continue
+                st.progress((k + 1) / max(1, len(grid)), text=f"Progresso: {k+1}/{len(grid)} configurazioni completate.")
+
+        st.balloons()
+        st.success("✅ Analisi completata!")
+
+        if len(bundle_rows) == 0:
+            st.warning("Nessuna configurazione valida. Controlla i parametri.")
+            st.stop()
+        
+        df_bundle = pd.DataFrame(bundle_rows).reset_index(drop=True)
+        st.session_state['df_bundle'] = df_bundle
+        st.session_state['oos_concat_map'] = oos_concat_map
 
 # ============================
-# Esegui il Bundle
+# Tabs per i Risultati (mostrate solo dopo l'esecuzione)
 # ============================
-bundle_rows = []
-oos_concat_map: Dict[str, pd.Series] = {}
+if 'df_bundle' in st.session_state:
+    df_bundle = st.session_state['df_bundle']
+    oos_concat_map = st.session_state['oos_concat_map']
 
-progress = st.progress(0.0, text="Elaborazione bundle…")
-
-for k, (is_amt, oos_amt, mode) in enumerate(grid):
-    oos_concat, stats, details = run_wf_config_concat_oos(
-        data, start_date=pd.to_datetime(start_date),
-        is_amt=is_amt, oos_amt=oos_amt, unit=time_unit,
-        mode=mode, purge_days=int(purge_days),
-        metric=metric, ann=int(ann)
-    )
-    key = f"IS={is_amt}{time_unit[0]} | OOS={oos_amt}{time_unit[0]} | {mode}"
-    oos_concat_map[key] = oos_concat
-    bundle_rows.append({"config": key, **stats, **details})
-
-    progress.progress((k + 1) / max(1, len(grid)), text=f"{k+1}/{len(grid)} configurazioni")
-
-progress.empty()
-
-# ============================
-# Tabs
-# ============================
-if len(bundle_rows) == 0:
-    st.warning("Nessuna configurazione valida. Controlla range date, IS/OOS e unità.")
-else:
-    df_bundle = pd.DataFrame(bundle_rows).reset_index(drop=True)
-    tab_bundle, tab_heatmap, tab_metrics, tab_downloads = st.tabs(["Bundle", "Heatmap", "Metriche & tabella", "Download"])
+    tab_bundle, tab_heatmap, tab_metrics, tab_downloads = st.tabs(["Bundle", "Heatmap", "Metriche & Tabella", "Download"])
 
     # --- BUNDLE PLOT ---
     with tab_bundle:
-        st.subheader("📈 Bundle delle equity OOS concatenati — tutte le configurazioni")
+        st.subheader("📈 Bundle delle equity OOS concatenate")
+        
+        col1, col2 = st.columns([1, 2])
+        with col1:
+            cfg_list = ["(nessuna)"] + list(df_bundle["config"])
+            chosen = st.selectbox("Evidenzia una configurazione", cfg_list, index=0)
+            st.markdown("---")
+            if chosen != "(nessuna)":
+                st.caption(f"Dettagli: **{chosen}**")
+                chosen_row = df_bundle[df_bundle["config"] == chosen].iloc[0]
+                st.metric("Sharpe", f"{chosen_row['Sharpe']:.2f}")
+                st.metric("CAGR", f"{chosen_row['CAGR']:.2%}")
+                st.metric("Max Drawdown", f"{chosen_row['Max Drawdown']:.2%}")
 
-        # 1) equity per tutte le configurazioni
-        eq_all = {k: equity_curve_from_oos(v) for k, v in oos_concat_map.items()}
-        eq_df = pd.DataFrame(eq_all)
-
-        # 2) downsample SOLO per display
-        df_disp = resample_for_display(eq_df, display_freq)
-
-        # 3) select per evidenziare una configurazione
-        cfg_list = ["(nessuna)"] + list(df_disp.columns)
-        chosen = st.selectbox("Evidenzia una configurazione", cfg_list, index=0)
-
-        # 4) banda p10–p90 + mediana
-        band = None
-        if show_band and not df_disp.empty:
-            p10 = df_disp.quantile(0.10, axis=1, interpolation="linear")
-            p50 = df_disp.quantile(0.50, axis=1, interpolation="linear")
-            p90 = df_disp.quantile(0.90, axis=1, interpolation="linear")
-            band_df = pd.DataFrame({"date": df_disp.index, "p10": p10.values, "p50": p50.values, "p90": p90.values}).dropna()
-            band = (
-                alt.Chart(band_df).mark_area(opacity=0.25).encode(x="date:T", y="p10:Q", y2="p90:Q")
-            ) + (
-                alt.Chart(band_df).mark_line().encode(x="date:T", y="p50:Q")
-            )
-
-        # 5) tutte le linee (leggere, senza tooltip)
-        eq_long = (
-            df_disp.reset_index()
-                  .melt("index", var_name="config", value_name="equity")
-                  .rename(columns={"index": "date"})
-        )
-        lines = (
-            alt.Chart(eq_long.dropna())
-            .mark_line(opacity=float(line_opacity))
-            .encode(
-                x=alt.X("date:T", title="Data"),
-                y=alt.Y("equity:Q", title="PnL cumulato (solo OOS concatenati)", scale=alt.Scale(zero=True)),
-                color=alt.Color("config:N", legend=None),
-            )
-            .properties(height=420)
-            .interactive()
-        )
-
-        # 6) overlay evidenziato (se scelto)
-        if chosen != "(nessuna)" and chosen in df_disp.columns:
-            hi = (
-                alt.Chart(
-                    df_disp[[chosen]].rename(columns={chosen: "equity"})
-                    .reset_index().rename(columns={"index": "date"})
+        with col2:
+            eq_all = {k: equity_curve_from_oos(v) for k, v in oos_concat_map.items()}
+            eq_df = pd.DataFrame(eq_all)
+            df_disp = resample_for_display(eq_df, display_freq)
+            
+            band = None
+            if show_band and not df_disp.empty:
+                p10 = df_disp.quantile(0.10, axis=1)
+                p50 = df_disp.quantile(0.50, axis=1)
+                p90 = df_disp.quantile(0.90, axis=1)
+                band_df = pd.DataFrame({"date": df_disp.index, "p10": p10.values, "p50": p50.values, "p90": p90.values}).dropna()
+                band = (
+                    alt.Chart(band_df).mark_area(opacity=0.25).encode(x="date:T", y="p10:Q", y2="p90:Q", color=alt.value("lightblue"))
+                ) + (
+                    alt.Chart(band_df).mark_line().encode(x="date:T", y="p50:Q", color=alt.value("darkblue"), tooltip=[alt.Tooltip("p50", title="Mediana", format=".2f")])
                 )
-                .mark_line(size=2.5)
-                .encode(x="date:T", y=alt.Y("equity:Q", scale=alt.Scale(zero=True)))
-            )
-            chart = (band + lines + hi) if band is not None else (lines + hi)
-        else:
-            chart = (band + lines) if band is not None else lines
 
-        st.altair_chart(chart, use_container_width=True)
+            eq_long = (
+                df_disp.reset_index()
+                        .melt("index", var_name="config", value_name="equity")
+                        .rename(columns={"index": "date"})
+            )
+            lines = (
+                alt.Chart(eq_long.dropna())
+                .mark_line(opacity=float(line_opacity))
+                .encode(
+                    x=alt.X("date:T", title="Data"),
+                    y=alt.Y("equity:Q", title="PnL cumulato (solo OOS)", scale=alt.Scale(zero=True)),
+                    color=alt.Color("config:N", legend=None),
+                    tooltip=[alt.Tooltip("config", title="Configurazione"), alt.Tooltip("equity", title="PnL", format=".2f")]
+                )
+                .properties(height=420)
+                .interactive()
+            )
+
+            if chosen != "(nessuna)":
+                hi = (
+                    alt.Chart(
+                        df_disp[[chosen]].rename(columns={chosen: "equity"})
+                        .reset_index().rename(columns={"index": "date"})
+                    )
+                    .mark_line(size=3)
+                    .encode(x="date:T", y=alt.Y("equity:Q"), color=alt.value("red"))
+                )
+                chart = (band + lines + hi) if band is not None else (lines + hi)
+            else:
+                chart = (band + lines) if band is not None else lines
+            
+            st.altair_chart(chart, use_container_width=True)
 
     # --- HEATMAP ---
     with tab_heatmap:
-        st.subheader("🗺️ Heatmap della metrica sulla griglia (per modalità selezionata)")
+        st.subheader("🗺️ Heatmap della metrica sulla griglia")
         if not df_bundle.empty:
             hm = df_bundle.copy()
-            hm["IS"] = [x.split("|")[0].split("=")[1].strip() for x in hm["config"]]
-            hm["OOS"] = [x.split("|")[1].split("=")[1].strip() for x in hm["config"]]
+            hm["IS"] = [re.search(r"IS=(\d+\.?\d*)[a-z]", x).group(1) for x in hm["config"]]
+            hm["OOS"] = [re.search(r"OOS=(\d+\.?\d*)[a-z]", x).group(1) for x in hm["config"]]
             hm["Mode"] = hm["mode"].astype(str)
             metric_col = metric if metric in hm.columns else "Sharpe"
             hm[metric_col] = pd.to_numeric(hm[metric_col], errors="coerce")
@@ -465,7 +472,7 @@ else:
                 .properties(height=320)
             )
             modes_unique = hm["Mode"].unique().tolist()
-            ch = base.facet(column=alt.Column("Mode:N", title="Mode")) if len(modes_unique) > 1 else base.properties(title=f"Mode: {modes_unique[0]}")
+            ch = base.facet(column=alt.Column("Mode:N", title="Modalità")) if len(modes_unique) > 1 else base.properties(title=f"Modalità: {modes_unique[0]}")
             st.altair_chart(ch, use_container_width=True)
         else:
             st.info("Nessun dato per la heatmap.")
@@ -476,10 +483,11 @@ else:
         metric_col = metric if metric in df_bundle.columns else "Sharpe"
         vals = pd.to_numeric(df_bundle[metric_col], errors="coerce").dropna()
         if not vals.empty:
-            p5, p25, p50, p75, p95 = np.percentile(vals, [5,25,50,75,95])
             c1, c2, c3, c4, c5 = st.columns(5)
-            c1.metric("p5", f"{p5:.3f}"); c2.metric("p25", f"{p25:.3f}")
-            c3.metric("median", f"{p50:.3f}"); c4.metric("p75", f"{p75:.3f}"); c5.metric("p95", f"{p95:.3f}")
+            c1.metric("Mediana", f"{vals.median():.3f}"); c2.metric("Media", f"{vals.mean():.3f}")
+            c3.metric("Max", f"{vals.max():.3f}"); c4.metric("Min", f"{vals.min():.3f}")
+            c5.metric("Dev.Std.", f"{vals.std():.3f}")
+            
             ch = alt.Chart(df_bundle[[metric_col]]).mark_bar().encode(
                 alt.X(f"{metric_col}:Q", bin=alt.Bin(maxbins=40)), y="count()"
             ).properties(height=300)
@@ -490,7 +498,7 @@ else:
 
     # --- DOWNLOAD ---
     with tab_downloads:
-        st.subheader("⬇️ Download risultati / OOS concatenati")
+        st.subheader("⬇️ Download risultati")
         st.download_button(
             "Scarica tabella configurazioni (CSV)",
             data=df_bundle.to_csv(index=False),
