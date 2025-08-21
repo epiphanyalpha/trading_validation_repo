@@ -349,12 +349,14 @@ if len(bundle_rows) == 0:
 df_bundle = pd.DataFrame(bundle_rows).reset_index(drop=True)
 
 # ============================
-# TAB 1 — Bundle Plot (ultralight)
+# TAB 1 — Bundle Plot (clean & stable)
 # ============================
-tab_bundle, tab_heatmap, tab_metrics, tab_downloads = st.tabs(["Bundle", "Heatmap", "Metriche", "Download"])
+tab_bundle, tab_heatmap, tab_metrics, tab_downloads = st.tabs(
+    ["Bundle", "Heatmap", "Metriche", "Download"]
+)
 
 with tab_bundle:
-    st.subheader("📈 Bundle OOS concatenati (light)")
+    st.subheader("📈 Bundle OOS concatenati")
 
     if len(oos_concat_map) == 0:
         st.info("Nessuna equity da plottare.")
@@ -369,36 +371,24 @@ with tab_bundle:
             idx = np.linspace(0, len(eq_df) - 1, Nmax, dtype=int)
             eq_df = eq_df.iloc[idx]
 
-        # 3) calcolo banda robustezza
-        p10 = eq_df.quantile(0.10, axis=1, interpolation="linear")
-        p50 = eq_df.quantile(0.50, axis=1, interpolation="linear")
-        p90 = eq_df.quantile(0.90, axis=1, interpolation="linear")
-        band_df = pd.DataFrame({
-            "date": eq_df.index,
-            "p10": p10,
-            "p50": p50,
-            "p90": p90
-        }).dropna()
+        # 3) calcolo mediana
+        median_curve = eq_df.median(axis=1)
 
-        # 4) banda robustezza (area + mediana)
-        band = (
-            alt.Chart(band_df.reset_index())
-            .mark_area(opacity=0.25, color="#4C78A8")
-            .encode(x="date:T", y="p10:Q", y2="p90:Q")
-        ) + (
-            alt.Chart(band_df.reset_index())
-            .mark_line(color="white")
-            .encode(x="date:T", y="p50:Q")
-        )
-
-        # 5) nuvola di tutte le linee
+        # 4) tutte le linee in grigio leggero
         cloud = (
             alt.Chart(eq_df.reset_index().melt("index", var_name="config", value_name="equity"))
-            .mark_line(opacity=0.05, color="gray")
+            .mark_line(opacity=0.15, color="gray")
             .encode(x="index:T", y="equity:Q")
         )
 
-        # 6) Overlay: evidenzia UNA configurazione (selezionabile)
+        # 5) linea mediana in bianco
+        median_line = (
+            alt.Chart(median_curve.reset_index().rename(columns={"index": "date", 0: "equity"}))
+            .mark_line(color="white", size=2)
+            .encode(x="date:T", y="equity:Q")
+        )
+
+        # 6) Overlay opzionale: evidenzia UNA configurazione
         cfg_list = ["(nessuna)"] + list(eq_df.columns)
         chosen = st.selectbox("Evidenzia configurazione", cfg_list, index=0)
 
@@ -407,16 +397,16 @@ with tab_bundle:
             highlight = (
                 alt.Chart(eq_df[[chosen]].reset_index().rename(columns={"index": "date", chosen: "equity"}))
                 .mark_line(size=3, color="#FFD166")
-                .encode(x="date:T", y=alt.Y("equity:Q", scale=alt.Scale(zero=True)))
+                .encode(x="date:T", y="equity:Q")
             )
 
         # 7) composizione finale
-        chart = band + cloud
+        chart = cloud + median_line
         if highlight is not None:
             chart = chart + highlight
 
         st.altair_chart(chart.properties(height=460), use_container_width=True)
-        st.markdown('</div>', unsafe_allow_html=True)
+
 
 
 
@@ -493,4 +483,5 @@ with tab_downloads:
     )
     st.markdown('<span class="small">I CSV sono in formato largo: colonne=Configurazioni, righe=timestamp.</span>', unsafe_allow_html=True)
     st.markdown('</div>', unsafe_allow_html=True)
+
 
