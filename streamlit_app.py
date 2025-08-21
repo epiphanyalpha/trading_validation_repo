@@ -1,6 +1,5 @@
 # =========================================================
-# streamlit_app.py — Walk-Forward Bundle (v3) - Versione Ottimizzata
-# Focus: Prestazioni, Fluidità, Design
+# streamlit_app.py — Walk-Forward Bundle (v3) - Versione Funzionante
 # =========================================================
 
 import streamlit as st
@@ -12,13 +11,13 @@ from typing import List, Tuple, Dict
 import re
 import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
+import io
 
 # ============================
-# Configurazione Pagina
+# Configurazione Pagina & Titolo
 # ============================
-st.set_page_config(page_title="🚀 WFB Bundle v3 — Ottimizzato", layout="wide")
+st.set_page_config(page_title="🚀 WFB Bundle v3 — Funzionante", layout="wide")
 st.title("🚶‍♂️📦 Walk-Forward Bundle — Concatenazione OOS (v3)")
-
 st.markdown(
     """
 Questa app esegue un **Walk-Forward Bundle (WFB)** con **step = OOS** (OOS non sovrapposti).
@@ -65,16 +64,14 @@ with st.sidebar:
     ann    = st.number_input("Fattore annualizzazione", 1, 366, 252, 1)
 
 # ============================
-# Utils — Dati & Metriche
+# Utils — Dati & Metriche (funzioni globali)
 # ============================
-@st.cache_data(show_spinner=False)
 def generate_demo(n_strats: int, n_periods: int, sigma: float, seed: int) -> pd.DataFrame:
     rng = np.random.default_rng(int(seed))
     data = {f"strategy_{i}": rng.normal(0.0, float(sigma), size=int(n_periods)) for i in range(int(n_strats))}
     idx = pd.date_range("2010-01-01", periods=int(n_periods), freq="D")
     return pd.DataFrame(data, index=idx)
 
-@st.cache_data(show_spinner=False)
 def load_csv(file) -> pd.DataFrame:
     df = pd.read_csv(file, index_col=0)
     try:
@@ -226,10 +223,35 @@ def build_wf_splits(index: pd.DatetimeIndex, start_date: pd.Timestamp,
     return splits
 
 # ============================
-# WF per configurazione → OOS concatenata + stats
+# Funzione per l'esecuzione parallela
 # ============================
-def run_wf_config_concat_oos(data: pd.DataFrame, start_date, is_amt, oos_amt,
-                             unit, mode, purge_days, metric, ann):
+def run_wf_config_concat_oos_wrapper(
+    params: dict, data_buffer: io.BytesIO = None, data_is_demo: bool = False
+):
+    """
+    Funzione wrapper per l'esecuzione in un processo separato.
+    Accetta un buffer di dati o parametri per la demo per evitare problemi di serializzazione.
+    """
+    if data_is_demo:
+        data = generate_demo(params['n_strategies'], params['n_periods'], params['sigma_demo'], params['seed_demo'])
+    else:
+        data = pd.read_csv(data_buffer, index_col=0)
+        data.index = pd.to_datetime(data.index)
+
+    return run_wf_config_concat_oos(
+        data=data,
+        start_date=pd.to_datetime(params['start_date']),
+        is_amt=params['is_amt'],
+        oos_amt=params['oos_amt'],
+        unit=params['time_unit'],
+        mode=params['mode'],
+        purge_days=params['purge_days'],
+        metric=params['metric'],
+        ann=params['ann']
+    )
+
+def run_wf_config_concat_oos(data, start_date, is_amt, oos_amt, unit, mode, purge_days, metric, ann):
+    # La tua funzione originale, ma ora non è più "globale"
     X = data.to_numpy(copy=False)
     T, N = X.shape
     cs  = np.vstack([np.zeros((1, N)), np.cumsum(X, axis=0)])
@@ -286,14 +308,23 @@ def run_wf_config_concat_oos(data: pd.DataFrame, start_date, is_amt, oos_amt,
     return oos_concat, stats, details
 
 # ============================
-# Carica dati
+# Logica Principale Streamlit
 # ============================
-if uploaded is not None:
-    data = load_csv(uploaded)
-    st.success("✅ File caricato e normalizzato.")
-else:
-    st.info("ℹ️ Nessun file caricato: uso dataset demo i.i.d. N(0, σ²).")
-    data = generate_demo(n_strategies, n_periods, sigma_demo, seed_demo)
+# Carica o genera i dati una volta e li memorizza nella sessione
+@st.cache_resource(show_spinner="Caricamento dati...")
+def get_data(uploaded_file, n_strats, n_periods, sigma_demo, seed_demo):
+    if uploaded_file is not None:
+        data = load_csv(uploaded_file)
+        file_info = uploaded_file.name
+        st.success("✅ File caricato e normalizzato.")
+    else:
+        data = generate_demo(n_strats, n_periods, sigma_demo, seed_demo)
+        file_info = "Dataset Demo"
+        st.info("ℹ️ Nessun file caricato: uso dataset demo.")
+    return data, file_info
+
+data, file_info = get_data(uploaded, n_strategies, n_periods, sigma_demo, seed_demo)
+st.markdown(f"**Dati in uso:** `{file_info}`")
 
 if 'ann_initialized' not in st.session_state:
     st.session_state['ann_initialized'] = True
@@ -343,32 +374,49 @@ st.write(f"**Configurazioni nel bundle:** {len(grid)} — (unità: {time_unit}, 
 
 if st.button("▶️ Esegui Walk-Forward Bundle"):
     with st.spinner("🚀 Esecuzione in corso... Potrebbe volerci qualche istante..."):
+        
+        # Prepara i dati da passare ai processi figli
+        data_buffer = io.BytesIO()
+        data.to_csv(data_buffer, index=True)
+        data_buffer.seek(0)
+        
+        tasks = []
+        for is_amt, oos_amt, mode in grid:
+            params = {
+                'start_date': start_date.isoformat(),
+                'is_amt': is_amt, 'oos_amt': oos_amt, 'time_unit': time_unit,
+                'mode': mode, 'purge_days': int(purge_days), 'metric': metric, 'ann': int(ann),
+                'n_strategies': n_strategies, 'n_periods': n_periods, 'sigma_demo': sigma_demo, 'seed_demo': seed_demo
+            }
+            tasks.append(params)
+        
         bundle_rows = []
         oos_concat_map: Dict[str, pd.Series] = {}
         max_workers = os.cpu_count() or 4
         
         with ProcessPoolExecutor(max_workers=max_workers) as executor:
-            futures = {
-                executor.submit(run_wf_config_concat_oos, data, pd.to_datetime(start_date), is_amt, oos_amt, time_unit, mode, int(purge_days), metric, int(ann)): (is_amt, oos_amt, mode)
-                for is_amt, oos_amt, mode in grid
-            }
+            if uploaded is not None:
+                futures = {executor.submit(run_wf_config_concat_oos_wrapper, params, data_buffer=data_buffer): params for params in tasks}
+            else:
+                futures = {executor.submit(run_wf_config_concat_oos_wrapper, params, data_is_demo=True): params for params in tasks}
+                
             for k, future in enumerate(as_completed(futures)):
+                params = futures[future]
                 try:
                     oos_concat, stats, details = future.result()
                     key = f"IS={details['is']}{time_unit[0]} | OOS={details['oos']}{time_unit[0]} | {details['mode']}"
                     oos_concat_map[key] = oos_concat
                     bundle_rows.append({"config": key, **stats, **details})
                 except Exception as exc:
-                    st.error(f"Errore nell'elaborazione: {exc}")
+                    st.error(f"Errore nell'elaborazione della configurazione {params}: {exc}")
                     continue
                 st.progress((k + 1) / max(1, len(grid)), text=f"Progresso: {k+1}/{len(grid)} configurazioni completate.")
-
+        
         st.balloons()
         st.success("✅ Analisi completata!")
 
         if len(bundle_rows) == 0:
             st.warning("Nessuna configurazione valida. Controlla i parametri.")
-            st.stop()
         
         df_bundle = pd.DataFrame(bundle_rows).reset_index(drop=True)
         st.session_state['df_bundle'] = df_bundle
