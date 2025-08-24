@@ -452,11 +452,12 @@ st.caption("Nello schema mostriamo solo i primi 4 step per illustrare il meccani
 
 st.markdown("#### 🎞️ Bundle: più walk-forward a confronto")
 try:
-    video_bytes = load_bytes("assets/1750240471108.mp4")
-    st.video(video_bytes)  # semplice e leggero
+    video_bytes = load_bytes("1750240471108.mp4")   # <-- niente assets/, è nella root
+    st.video(video_bytes)
     st.caption("Nel bundle combiniamo le OOS di configurazioni multiple (illustrazione animata).")
 except FileNotFoundError:
-    st.warning("Video non trovato in assets/. Sposta 1750240471108.mp4 in assets/ oppure aggiorna il percorso.")
+    st.warning("Video non trovato. Assicurati che 1750240471108.mp4 sia nella stessa cartella di streamlit_app.py.")
+
 
 
 
@@ -663,5 +664,6 @@ with tab_downloads:
 
 st.markdown("---")
 st.caption("© Walk-Forward Bundle Validator — built for clarity & robustness.")
+
 
 
