@@ -410,7 +410,7 @@ cum = data.cumsum(); cum.index.name = "date"
 prev_df = cum.reset_index().melt("date", var_name="strategy", value_name="pnl")
 prev_chart = (
     alt.Chart(prev_df)
-    .mark_line(strokeWidth=1, opacity=0. Nine, clip=True)
+    .mark_line(strokeWidth=1, opacity=0.9, clip=True)
     .encode(
         x=alt.X("date:T", title="Date"),
         y=alt.Y("pnl:Q", title="Cumulative PnL", scale=alt.Scale(zero=True)),
@@ -603,3 +603,4 @@ with tab_downloads:
 # ----------------------------
 st.markdown("---")
 st.caption("© Walk-Forward Bundle Validator — built for clarity & robustness.")
+
