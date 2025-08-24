@@ -43,19 +43,28 @@ footer { visibility: hidden; }
 # Intro
 # ----------------------------
 st.title("⚡ Walk-Forward Bundle Validator")
+
 st.markdown(
     """
-This app validates strategies using a **Walk-Forward Bundle (WFB)**: instead of one IS/OOS split,
-it runs **many configurations**, concatenates **OOS** returns, and compares the resulting equity curves.
+### What is this app?  
+This is a **Streamlit web app** to experiment with the *Walk-Forward Bundle* (WFB) validation method for trading strategies.
 
-**Idea**
-- Multiple walk-forward configs (different IS/OOS lengths, sliding vs expanding).
-- Concatenate **out-of-sample** returns per config.
-- If many configs remain stable → strategy is **robust**, not overfit.
+### Why Walk-Forward Bundle?  
+Instead of relying on a single walk-forward configuration, WFB tests **many different IS/OOS splits and modes**.  
+The OOS returns from all these configurations are concatenated into **bundles**.  
+If most bundles look stable → the strategy is likely robust.  
+If results vary wildly → the strategy is probably overfit.
+
+### What can you do here?  
+- Upload your **own CSV of strategy returns** or play with **demo data**.  
+- Select IS/OOS lengths, mode (sliding or expanding), and metrics.  
+- Visualize walk-forward splits, equity bundles, performance heatmaps, and distributions.  
+- Download results for further analysis.
 
 Use the sidebar to upload a CSV (rows=time, columns=strategies, values=returns) or generate demo data.
 """
 )
+
 st.divider()
 
 # ============================
@@ -381,7 +390,12 @@ if len(grid) > max_configs:
     grid = grid[:max_configs]
     st.info(f"🔎 Limited to {max_configs} configurations (increase the limit to run more).")
 
-st.write(f"**Configurations in bundle:** {len(grid)} — (IS in {is_unit}, OOS in {oos_unit}, step = OOS, non-overlapping)")
+#st.write(f"**Configurations in bundle:** {len(grid)} — (IS in {is_unit}, OOS in {oos_unit}, step = OOS, non-overlapping)")
+st.write(
+    f"🔧 We are testing **{len(grid)} different parameter sets** "
+    f"(combinations of IS length, OOS length, and walk-forward mode)."
+)
+
 
 # Fail-early sanity check: explain if no split is possible
 first_date, last_date = pd.to_datetime(data.index.min()), pd.to_datetime(data.index.max())
@@ -543,3 +557,4 @@ with tab_downloads:
 # ----------------------------
 st.markdown("---")
 st.caption("© Walk-Forward Bundle Validator — built for clarity & robustness.")
+
