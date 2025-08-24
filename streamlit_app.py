@@ -13,6 +13,10 @@ st.set_page_config(
     page_title="Walk-Forward Bundle Validator",
     layout="wide"
 )
+@st.cache_resource(show_spinner=False)
+def load_bytes(path: str) -> bytes:
+    with open(path, "rb") as f:
+        return f.read()
 
 # -------------------------------------------------
 # Altair: light theme, hide toolbar, no interactivity
@@ -649,3 +653,4 @@ with tab_downloads:
 
 st.markdown("---")
 st.caption("© Walk-Forward Bundle Validator — built for clarity & robustness.")
+
