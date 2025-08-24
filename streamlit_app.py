@@ -53,15 +53,25 @@ This is a **Streamlit web app** to experiment with the *Walk-Forward Bundle* (WF
 Instead of relying on a single walk-forward configuration, WFB tests **many different IS/OOS splits and modes**.  
 The OOS returns from all these configurations are concatenated into **bundles**.  
 If most bundles look stable → the strategy is likely robust.  
-If results vary wildly → the strategy is probably overfit.
+If results vary wildly → the strategy is probably overfit.  
+The goal is to assess **robustness**, not to cherry-pick the “best” setup.
 
 ### What can you do here?  
 - Upload your **own CSV of strategy returns** or play with **demo data**.  
-- Select IS/OOS lengths, mode (sliding or expanding), and metrics.  
-- Visualize walk-forward splits, equity bundles, performance heatmaps, and distributions.  
+- Select IS/OOS lengths, walk-forward mode (sliding or expanding), and evaluation metrics.  
+- Visualize:  
+  - Walk-forward splits (IS → Embargo → OOS)  
+  - Equity bundles (all concatenated OOS series)  
+  - Heatmaps of performance across IS/OOS grid  
+  - Metric distributions  
 - Download results for further analysis.
 
-Use the sidebar to upload a CSV (rows=time, columns=strategies, values=returns) or generate demo data.
+👉 **CSV format expected:**  
+- Rows = time index (preferably dates)  
+- Columns = strategies  
+- Values = returns per period
+
+Use the **sidebar** to upload your data or generate demo simulations.
 """
 )
 
@@ -188,6 +198,11 @@ def build_wf_splits(index: pd.DatetimeIndex, start_date: pd.Timestamp,
             is_s = idx.searchsorted(is_start_date, side="left"); is_e = is_end_pos
         elif mode == "expanding":
             is_s, is_e = 0, is_end_pos
+            if is_e <= 0:  # safety
+                next_anchor_date = add_offset(idx[anchor], unit=oos_unit, amount=oos_amt)
+                anchor = idx.searchsorted(next_anchor_date, side="left")
+                if anchor >= T: break
+                continue
             min_req = add_offset(idx[0], unit=is_unit, amount=is_amt)
             if idx[is_e - 1] < min_req:
                 next_anchor_date = add_offset(idx[anchor], unit=oos_unit, amount=oos_amt)
@@ -289,7 +304,7 @@ with st.sidebar:
     st.caption("Tip: 252 ~ trading days; 365 ~ calendar days.")
 
 # ============================
-# Load data
+# Load data + validation
 # ============================
 if uploaded is not None:
     data = load_csv(uploaded)
@@ -299,6 +314,28 @@ else:
     st.info("ℹ️ Demo dataset in use")
     st.caption(f"Demo seed = {seed_demo}")
 
+# ---- Robust validation ----
+if data is None or data.empty:
+    st.error("Your dataset is empty or has no numeric strategy columns after cleaning.")
+    st.stop()
+
+# Ensure datetime index
+if not isinstance(data.index, pd.DatetimeIndex):
+    try:
+        data.index = pd.to_datetime(data.index, errors="coerce")
+    except Exception:
+        pass
+if data.index.isna().any():
+    data = data[~data.index.isna()]
+if not isinstance(data.index, pd.DatetimeIndex) or data.empty:
+    st.error(
+        "The CSV index must be a date/time column. Expected format:\n"
+        "• Rows = dates (index)\n• Columns = strategies\n• Values = returns per period"
+    )
+    st.stop()
+data = data.sort_index()
+
+# Annualization suggestion
 if 'ann_initialized' not in st.session_state:
     st.session_state['ann_initialized'] = True
     ann_default = infer_ann_from_index(data.index)
@@ -310,6 +347,12 @@ if 'ann_initialized' not in st.session_state:
 # ============================
 def parse_list_nums(txt: str):
     return [float(x) for x in re.split(r"[\s,;]+", str(txt).strip()) if x]
+
+IS_list  = parse_list_nums(is_txt)
+OOS_list = parse_list_nums(oos_txt)
+if not IS_list or not OOS_list:
+    st.warning("Please enter at least one IS value and one OOS value.")
+    st.stop()
 
 def wf_schematic(start_date, is_unit, oos_unit, is_amt, oos_amt, purge_days=1, splits=4) -> alt.Chart:
     def _off(dt, unit, amt): return add_offset(dt, unit=unit, amount=amt)
@@ -341,8 +384,6 @@ def wf_schematic(start_date, is_unit, oos_unit, is_amt, oos_amt, purge_days=1, s
     )
 
 st.markdown("#### Visual schema: IS → Embargo → OOS (step = OOS)")
-IS_list  = parse_list_nums(is_txt)
-OOS_list = parse_list_nums(oos_txt)
 is_first  = IS_list[0]  if IS_list  else 3.0
 oos_first = OOS_list[0] if OOS_list else 63.0
 st.altair_chart(
@@ -369,7 +410,7 @@ cum = data.cumsum(); cum.index.name = "date"
 prev_df = cum.reset_index().melt("date", var_name="strategy", value_name="pnl")
 prev_chart = (
     alt.Chart(prev_df)
-    .mark_line(strokeWidth=1, opacity=0.9, clip=True)
+    .mark_line(strokeWidth=1, opacity=0. Nine, clip=True)
     .encode(
         x=alt.X("date:T", title="Date"),
         y=alt.Y("pnl:Q", title="Cumulative PnL", scale=alt.Scale(zero=True)),
@@ -386,16 +427,21 @@ st.altair_chart(prev_chart, use_container_width=True)
 modes = modes_sel if modes_sel else ["sliding"]
 from itertools import product
 grid = list(product(IS_list, OOS_list, modes))
+if not grid:
+    st.warning("No configurations to run. Please enter at least one IS and one OOS value.")
+    st.stop()
 if len(grid) > max_configs:
     grid = grid[:max_configs]
     st.info(f"🔎 Limited to {max_configs} configurations (increase the limit to run more).")
 
-#st.write(f"**Configurations in bundle:** {len(grid)} — (IS in {is_unit}, OOS in {oos_unit}, step = OOS, non-overlapping)")
-st.write(
-    f"🔧 We are testing **{len(grid)} different parameter sets** "
-    f"(combinations of IS length, OOS length, and walk-forward mode)."
+st.markdown(
+    f"""
+**Configurations in bundle:** {len(grid)}  
+🔧 This means we are testing **{len(grid)} different parameter sets** —
+combinations of IS length, OOS length, and walk-forward mode  
+(step = OOS, non-overlapping).
+"""
 )
-
 
 # Fail-early sanity check: explain if no split is possible
 first_date, last_date = pd.to_datetime(data.index.min()), pd.to_datetime(data.index.max())
@@ -441,7 +487,7 @@ for k, (is_amt, oos_amt, mode) in enumerate(grid):
         mode=mode, purge_days=int(purge_days),
         metric=metric, ann=int(ann)
     )
-    key = f"IS={is_amt}{is_unit[0]} | OOS={oos_amt}{oos_unit[0]} | {mode}"
+    key = f"IS={is_amt} {is_unit} | OOS={oos_amt} {oos_unit} | {mode}"
     oos_concat_map[key] = oos_concat
     bundle_rows.append({"config": key, **stats, **details})
     progress.progress((k + 1) / max(1, len(grid)), text=f"{k+1}/{len(grid)} configs")
@@ -495,8 +541,8 @@ with tab_heatmap:
     st.subheader("🗺️ Metric heatmap (IS × OOS)")
     hm = df_bundle.copy()
     try:
-        hm["IS"]  = hm["config"].str.extract(r"IS=([^\|]+)\|")[0].str.strip().str.replace("IS=", "", regex=False)
-        hm["OOS"] = hm["config"].str.extract(r"OOS=([^\|]+)\|")[0].str.strip().str.replace("OOS=", "", regex=False)
+        hm["IS"]  = hm["config"].str.extract(r"IS=([^\|]+)\|")[0].str.strip()
+        hm["OOS"] = hm["config"].str.extract(r"OOS=([^\|]+)\|")[0].str.strip()
     except Exception:
         hm["IS"]  = hm.get("is", "").astype(str); hm["OOS"] = hm.get("oos", "").astype(str)
     hm["Mode"] = hm["mode"].astype(str)
@@ -557,4 +603,3 @@ with tab_downloads:
 # ----------------------------
 st.markdown("---")
 st.caption("© Walk-Forward Bundle Validator — built for clarity & robustness.")
-
