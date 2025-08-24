@@ -5,14 +5,15 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import altair as alt
-from pathlib import Path
-import json
 import re  # keep for parsing lists
+from typing import List, Tuple, Dict
 
 st.set_page_config(
     page_title="Walk-Forward Bundle Validator",
     layout="wide"
 )
+
+# ---------- Small utility: cached file loader ----------
 @st.cache_resource(show_spinner=False)
 def load_bytes(path: str) -> bytes:
     with open(path, "rb") as f:
@@ -21,10 +22,8 @@ def load_bytes(path: str) -> bytes:
 # -------------------------------------------------
 # Altair: light theme, hide toolbar, no interactivity
 # -------------------------------------------------
-# Avoid downsampling surprises on large frames
-alt.data_transformers.disable_max_rows()
-# Hide the Vega toolbar (keeps things clean & static)
-alt.renderers.set_embed_options(actions=False)
+alt.data_transformers.disable_max_rows()          # avoid silent downsampling
+alt.renderers.set_embed_options(actions=False)    # hide Vega toolbar
 
 def _wfb_theme():
     return {
@@ -53,13 +52,43 @@ footer { visibility: hidden; }
 """, unsafe_allow_html=True)
 
 # ----------------------------
-# Helper: mini schema diagram
+# Intro
+# ----------------------------
+st.title("⚡ Walk-Forward Bundle Validator")
+
+st.markdown(
+    """
+**What this app does**
+
+This tool validates a trading strategy with a *bundle* of walk-forward analyses.
+Instead of relying on a single IS/OOS split, it runs **many configurations** (different
+IS/OOS lengths, modes, and selection metrics), concatenates the **out-of-sample (OOS)**
+returns from each configuration, and compares the resulting equity curves.
+
+If *many* distinct walk-forward configurations deliver stable OOS performance, that's strong
+evidence your strategy is **robust** rather than overfit.
+
+**Key ideas**
+- *Walk-Forward:* repeatedly train on **IS (in-sample)** and test on **OOS (out-of-sample)**.
+- *Bundle:* run *multiple* walk-forward setups at once (various IS/OOS horizons, metrics).
+- *Robustness:* consistency across the bundle matters more than a single best setting.
+
+**How to use**
+1. Upload your strategies’ return series (rows = time, columns = strategies) or use the demo data.
+2. Define a grid of walk-forward configurations (IS/OOS units and lengths, mode, purge).
+3. Review:
+   - **Bundle equity**: concatenated OOS PnL for all configs (all lines, static).
+   - **Heatmap** of the selection metric across IS×OOS (by mode).
+   - **Distribution** of the chosen metric across the bundle.
+4. **Download** the summary and the concatenated OOS series.
+"""
+)
+
+# ----------------------------
+# Demo schema helpers (used below)
 # ----------------------------
 def make_walkforward_schema(n_is=3, n_oos=3, n_blocks=3):
-    """
-    Create a simple dataframe describing IS (green) and OOS (red) blocks
-    to visually explain the walk-forward idea.
-    """
+    """Simple dataframe with IS (green) and OOS (red) blocks to illustrate the idea."""
     data = []
     for block in range(n_blocks):
         for i in range(n_is):
@@ -79,35 +108,20 @@ def render_walkforward_schema():
             color=alt.Color(
                 "type:N",
                 scale=alt.Scale(domain=["IS", "OOS"], range=["#06D6A0", "#EF476F"]),
-                legend=alt.Legend(title="Blocco")
+                legend=alt.Legend(title="Block")
             )
         )
         .properties(width=300, height=200)
     )
     st.altair_chart(chart, use_container_width=False)
 
-# ----------------------------
-# Intro text + schema
-# ----------------------------
-st.title("⚡ Walk-Forward Bundle Validator")
-st.markdown(
-    """
-Benvenuto nell'app per la validazione **Walk-Forward Bundle**.  
-L'idea è semplice ma potente:
-- Si provano **più configurazioni** di Walk-Forward (diverse lunghezze IS/OOS, metriche di selezione).
-- Si concatenano i rendimenti **fuori-campione (OOS)** di ciascuna configurazione.
-- Si confrontano le equity line risultanti: se molte configurazioni sono stabili → strategia robusta.
-"""
-)
-#render_walkforward_schema()
 st.divider()
 
 # ============================
-# Parte 2 — Core funzioni + Sidebar + Caricamento + Bundle
+# Core functions + Sidebar + Load data + Bundle
 # ============================
 
 # ---- Config & caching helpers ----
-
 @st.cache_data(show_spinner=False)
 def generate_demo(n_strats: int, n_periods: int, sigma: float, seed: int) -> pd.DataFrame:
     rng = np.random.default_rng(int(seed))
@@ -135,7 +149,6 @@ def infer_ann_from_index(idx: pd.Index) -> int:
     return 252
 
 # ---- Metrics ----
-
 def sharpe(mean, std, ann):
     with np.errstate(divide='ignore', invalid='ignore'):
         return np.where(std > 0, (mean / std) * np.sqrt(ann), -np.inf)
@@ -156,16 +169,16 @@ def df_mdd_cols(df: pd.DataFrame) -> pd.Series:
     dd = (eq.cummax() - eq) / eq.cummax()
     return dd.max(axis=0)
 
-# ---- Equity helpers (PnL-like cumsum, as per demo style) ----
-
+# ---- Equity helpers (PnL-like cumsum, display-only resampling/decimation) ----
 def equity_curve_from_oos(oos: pd.Series) -> pd.Series:
     """PnL-like cumulative (starts at 0), robust to gaps."""
     return oos.fillna(0.0).cumsum()
 
-def resample_for_display(df: pd.DataFrame, freq: str) -> pd.DataFrame:
+def resample_for_display(df: pd.DataFrame, freq_label_internal: str) -> pd.DataFrame:
+    """freq_label_internal is one of: 'nessuno', 'settimanale', 'mensile'."""
     if not isinstance(df.index, pd.DatetimeIndex):
         return df
-    rule = {"nessuno": None, "settimanale": "W", "mensile": "M"}[freq]
+    rule = {"nessuno": None, "settimanale": "W", "mensile": "M"}[freq_label_internal]
     if rule is None:
         return df
     try:
@@ -182,7 +195,6 @@ def decimate_by_stride(df: pd.DataFrame, max_points: int) -> pd.DataFrame:
     return df.iloc[::stride]
 
 # ---- Selection segment stats ----
-
 def seg_stats(X: np.ndarray, a: int, b: int, cs: np.ndarray, css: np.ndarray):
     n = b - a
     if n <= 1:
@@ -203,8 +215,7 @@ def metric_scores(metric: str, mean, std, dn_std, ann, mdd_vec=None):
     if metric == "Max Drawdown": return -mdd_vec
     raise ValueError("Metric not supported")
 
-# ---- Date offsets (support separate units for IS and OOS) ----
-
+# ---- Date offsets (internal expects Italian: 'giorni' | 'mesi' | 'anni') ----
 def add_offset(dt: pd.Timestamp, unit: str, amount: float) -> pd.Timestamp:
     if unit == "giorni":
         return dt + pd.DateOffset(days=int(amount))
@@ -215,9 +226,6 @@ def add_offset(dt: pd.Timestamp, unit: str, amount: float) -> pd.Timestamp:
     raise ValueError("unit must be 'giorni' | 'mesi' | 'anni'")
 
 # ---- Build splits (step = OOS; non-overlapping OOS; embargo) ----
-
-from typing import List, Tuple, Dict
-
 def build_wf_splits(index: pd.DatetimeIndex, start_date: pd.Timestamp,
                     is_amt: float, oos_amt: float,
                     is_unit: str, oos_unit: str,
@@ -227,7 +235,7 @@ def build_wf_splits(index: pd.DatetimeIndex, start_date: pd.Timestamp,
     if T == 0:
         return []
 
-    # Require at least IS amount (in is_unit) before first anchor
+    # Require at least IS amount before first anchor
     min_is_end = add_offset(idx[0], unit=is_unit, amount=is_amt)
     first_anchor_date = max(pd.to_datetime(start_date), min_is_end)
     anchor = idx.searchsorted(first_anchor_date, side="left")
@@ -256,7 +264,7 @@ def build_wf_splits(index: pd.DatetimeIndex, start_date: pd.Timestamp,
         elif mode == "expanding":
             is_s = 0
             is_e = is_end_pos
-            # Need at least is_amt in is_unit
+            # Need at least is_amt before starting
             min_req = add_offset(idx[0], unit=is_unit, amount=is_amt)
             if idx[is_e - 1] < min_req:
                 next_anchor_date = add_offset(idx[anchor], unit=oos_unit, amount=oos_amt)
@@ -278,8 +286,7 @@ def build_wf_splits(index: pd.DatetimeIndex, start_date: pd.Timestamp,
 
     return splits
 
-# ---- Run WF for one configuration → concatenated OOS + stats ----
-
+# ---- Run one WF config → concatenated OOS + stats ----
 def run_wf_config_concat_oos(data: pd.DataFrame, start_date, is_amt, oos_amt,
                              is_unit, oos_unit, mode, purge_days, metric, ann):
     X = data.to_numpy(copy=False)
@@ -315,7 +322,7 @@ def run_wf_config_concat_oos(data: pd.DataFrame, start_date, is_amt, oos_amt,
         # append only the OOS of the winner
         oos_concat.iloc[o0:o1] = data.iloc[o0:o1, w_idx].to_numpy()
 
-    # Stats on concatenated OOS series
+    # Stats on concatenated OOS
     oos_ret = oos_concat.dropna()
     stats = {}
     if not oos_ret.empty:
@@ -344,58 +351,69 @@ def run_wf_config_concat_oos(data: pd.DataFrame, start_date, is_amt, oos_amt,
     return oos_concat, stats, details
 
 # ----------------------------
-# Sidebar — dati & griglia
+# Sidebar — data & grid (English UI → internal tokens)
 # ----------------------------
+# Mappings: English UI -> internal Italian tokens (so core functions remain unchanged)
+UNITS_EN_TO_IT = {"days": "giorni", "months": "mesi", "years": "anni"}
+UNIT_ABBR_EN   = {"days": "d",      "months": "m",   "years": "y"}
+DISPLAY_EN_TO_IT = {"none": "nessuno", "weekly": "settimanale", "monthly": "mensile"}
+
 with st.sidebar:
-    st.header("📦 Dati")
-    n_strategies = st.number_input("N° strategie (demo)", 1, 500, 12, 1)
-    n_periods    = st.number_input("N° periodi (demo)", 200, 100_000, 6000, 100)
-    sigma_demo   = st.number_input("Vol demo σ", 0.0001, 0.5, 0.01, 0.0001, format="%.4f")
-    seed_demo    = st.number_input("Seed demo", 0, 1_000_000, 42, 1)
-    uploaded     = st.file_uploader("📂 CSV (righe=periodi, colonne=strategie)", type=["csv"])
-    st.caption("Se non carichi nulla: dataset demo i.i.d. N(0, σ²) dal 2010 in poi.")
+    st.header("📦 Data")
+    n_strategies = st.number_input("Number of strategies (demo)", 1, 500, 12, 1)
+    n_periods    = st.number_input("Number of periods (demo)", 200, 100_000, 6000, 100)
+    sigma_demo   = st.number_input("Volatility σ (demo)", 0.0001, 0.5, 0.01, 0.0001, format="%.4f")
+    seed_demo    = st.number_input("Demo seed", 0, 1_000_000, 42, 1)
+    uploaded     = st.file_uploader("📂 CSV (rows=time, columns=strategies)", type=["csv"])
+    st.caption("If nothing is uploaded: demo i.i.d. N(0, σ²) data from 2010 onward.")
 
     st.divider()
-    st.header("🧭 Griglia bundle")
-    start_date   = st.date_input("Inizio WFB", value=pd.to_datetime("2013-01-01"))
-    is_unit   = st.radio("Unità IS",  ["giorni", "mesi", "anni"], index=2, horizontal=True)
-    oos_unit  = st.radio("Unità OOS", ["giorni", "mesi", "anni"], index=0, horizontal=True)
-    is_txt    = st.text_input("Lista IS",  value="3,5,8")     # espressi in 'is_unit'
-    oos_txt   = st.text_input("Lista OOS", value="63,126")    # espressi in 'oos_unit'
-    modes_sel = st.multiselect("Modalità", ["sliding","expanding"], default=["sliding"])
-    purge_days= st.number_input("Embargo/Purge (giorni)", 0, 365, 1, 1)
-    max_configs = st.number_input("Limite configurazioni", 1, 2000, 120, 1)
+    st.header("🧭 Bundle grid")
+    start_date    = st.date_input("Start date (WFB)", value=pd.to_datetime("2013-01-01"))
+
+    # English options; convert to internal strings for logic
+    is_unit_en  = st.radio("IS unit",  ["years", "months", "days"], index=0, horizontal=True)
+    oos_unit_en = st.radio("OOS unit", ["days", "months", "years"], index=0, horizontal=True)
+    is_unit  = UNITS_EN_TO_IT[is_unit_en]
+    oos_unit = UNITS_EN_TO_IT[oos_unit_en]
+
+    is_txt    = st.text_input("IS list (numbers; in IS unit)",  value="3,5,8")
+    oos_txt   = st.text_input("OOS list (numbers; in OOS unit)", value="63,126")
+    modes_sel = st.multiselect("Mode", ["sliding","expanding"], default=["sliding"])
+    purge_days= st.number_input("Embargo/Purge (days)", 0, 365, 1, 1)
+    max_configs = st.number_input("Config limit", 1, 2000, 120, 1)
 
     st.divider()
-    st.header("🎨 Grafico")
-    display_freq = st.selectbox("Campionamento display", ["nessuno", "settimanale", "mensile"], index=0)
-    max_points   = st.number_input("Max punti temporali (display)", 300, 20000, 2000, 100)
+    st.header("🎨 Chart")
+    display_freq_en = st.selectbox("Display sampling", ["none", "weekly", "monthly"], index=0)
+    display_freq_internal = DISPLAY_EN_TO_IT[display_freq_en]
+    max_points   = st.number_input("Max time points (display)", 300, 20000, 2000, 100)
 
     st.divider()
-    st.header("📏 Metrica selezione")
-    metric = st.selectbox("Metrica", ["Sharpe", "Mean return", "Sortino", "Max Drawdown"])
-    ann    = st.number_input("Fattore annualizzazione", 1, 366, 252, 1)
-    st.caption("Tip: 252 ~ giorni di trading; 365 ~ calendario.")
+    st.header("📏 Selection metric")
+    metric = st.selectbox("Metric", ["Sharpe", "Mean return", "Sortino", "Max Drawdown"])
+    ann    = st.number_input("Annualization factor", 1, 366, 252, 1)
+    st.caption("Tip: 252 ~ trading days; 365 ~ calendar days.")
 
 # ----------------------------
-# Caricamento dati
+# Load data
 # ----------------------------
 if uploaded is not None:
     data = load_csv(uploaded)
-    st.success("✅ CSV caricato (numeric only, drop all-NaN cols)")
+    st.success("✅ CSV loaded (numeric only, dropped all-NaN columns).")
 else:
     data = generate_demo(n_strategies, n_periods, sigma_demo, seed_demo)
-    st.info("ℹ️ Dataset demo i.i.d. N(0, σ²) in uso.")
+    st.info("ℹ️ Using demo i.i.d. N(0, σ²) dataset.")
     st.caption(f"Demo seed = {seed_demo}")
 
 if 'ann_initialized' not in st.session_state:
     st.session_state['ann_initialized'] = True
     ann_default = infer_ann_from_index(data.index)
     if ann == 252 and ann_default != 252:
-        st.toast(f"Suggerimento: ann={ann_default} dalla frequenza indice")
+        st.toast(f"Suggestion: ann={ann_default} inferred from index frequency")
 
 # ----------------------------
-# Schema WF parametrico (grande e leggibile)
+# Visual WF schematic (large & legible)
 # ----------------------------
 def parse_list_nums(txt: str):
     return [float(x) for x in re.split(r"[\s,;]+", str(txt).strip()) if x]
@@ -425,7 +443,7 @@ def wf_schematic(start_date, is_unit, oos_unit, is_amt, oos_amt, purge_days=1, s
         alt.Chart(df)
         .mark_bar(cornerRadius=3)  # subtle rounding, cheap
         .encode(
-            x=alt.X("start:T", title="Tempo"),
+            x=alt.X("start:T", title="Time"),
             x2="end:T",
             y=alt.Y("split:O", title="Split", sort="ascending",
                     scale=alt.Scale(padding=0.25)),
@@ -441,38 +459,35 @@ def wf_schematic(start_date, is_unit, oos_unit, is_amt, oos_amt, purge_days=1, s
         .properties(height=260)
     )
 
-st.markdown("#### Schema visivo: IS → Embargo → OOS (step = OOS)")
+st.markdown("#### Visual schema: IS → Embargo → OOS (step = OOS)")
 is_first  = parse_list_nums(is_txt)[0] if parse_list_nums(is_txt) else 3.0
 oos_first = parse_list_nums(oos_txt)[0] if parse_list_nums(oos_txt) else 63.0
 st.altair_chart(
     wf_schematic(start_date, is_unit, oos_unit, is_first, oos_first, int(purge_days), splits=4),
     use_container_width=True
 )
-st.caption("Nello schema mostriamo solo i primi 4 step per illustrare il meccanismo. I calcoli usano tutta la serie.")
+st.caption("Only the first 4 steps are shown for illustration. Calculations use the full series.")
 
-st.markdown("#### 🎞️ Bundle: più walk-forward a confronto")
+st.markdown("#### 🎞️ Bundle: multiple walk-forwards at a glance")
 try:
-    video_bytes = load_bytes("1750240471108.mp4")   # <-- niente assets/, è nella root
+    video_bytes = load_bytes("1750240471108.mp4")   # file placed in the repo root
     st.video(video_bytes)
-    st.caption("Nel bundle combiniamo le OOS di configurazioni multiple (illustrazione animata).")
+    st.caption("In the bundle we combine OOS returns from multiple configurations (animated illustration).")
 except FileNotFoundError:
-    st.warning("Video non trovato. Assicurati che 1750240471108.mp4 sia nella stessa cartella di streamlit_app.py.")
-
-
-
+    st.warning("Video not found. Make sure 1750240471108.mp4 is in the same folder as streamlit_app.py.")
 
 st.divider()
 
 # ----------------------------
-# Preview — PnL cumulato (tutte le strategie)
+# Preview — cumulative PnL (all strategies)
 # ----------------------------
-st.subheader("👀 Anteprima — PnL cumulato (tutte le strategie)")
+st.subheader("👀 Preview — Cumulative PnL (all strategies)")
 cum = data.cumsum()
 cum.index.name = "date"
 st.line_chart(cum, height=240, use_container_width=True)
 
 # ----------------------------
-# Costruisci griglia di configurazioni
+# Build configuration grid
 # ----------------------------
 IS_list  = parse_list_nums(is_txt)
 OOS_list = parse_list_nums(oos_txt)
@@ -482,75 +497,77 @@ from itertools import product
 grid = list(product(IS_list, OOS_list, modes))
 if len(grid) > max_configs:
     grid = grid[:max_configs]
-    st.info(f"🔎 Limitato a {max_configs} configurazioni (alza il limite per elaborarne di più).")
+    st.info(f"🔎 Limited to {max_configs} configurations (increase the limit to run more).")
 
-st.write(f"**Configurazioni nel bundle:** {len(grid)} — (IS in {is_unit}, OOS in {oos_unit}, step = OOS non sovrapposti)")
+# For display in the text below, we’ll show English unit abbreviations
+is_abbr_en  = UNIT_ABBR_EN[is_unit_en]
+oos_abbr_en = UNIT_ABBR_EN[oos_unit_en]
+
+st.write(f"**Configurations in bundle:** {len(grid)} — (IS in {is_unit_en}, OOS in {oos_unit_en}, step = OOS, non-overlapping)")
 
 # ----------------------------
-# Esegui il Bundle
+# Run the Bundle
 # ----------------------------
 bundle_rows = []
 oos_concat_map: Dict[str, pd.Series] = {}
 
-progress = st.progress(0.0, text="Elaborazione bundle…")
+progress = st.progress(0.0, text="Running bundle…")
 for k, (is_amt, oos_amt, mode) in enumerate(grid):
     oos_concat, stats, details = run_wf_config_concat_oos(
         data, start_date=pd.to_datetime(start_date),
         is_amt=is_amt, oos_amt=oos_amt,
-        is_unit=is_unit, oos_unit=oos_unit,
+        is_unit=is_unit, oos_unit=oos_unit,  # internal tokens
         mode=mode, purge_days=int(purge_days),
         metric=metric, ann=int(ann)
     )
-    key = f"IS={is_amt}{is_unit[0]} | OOS={oos_amt}{oos_unit[0]} | {mode}"
+    key = f"IS={is_amt}{is_abbr_en} | OOS={oos_amt}{oos_abbr_en} | {mode}"
     oos_concat_map[key] = oos_concat
     bundle_rows.append({"config": key, **stats, **details})
-    progress.progress((k + 1) / max(1, len(grid)), text=f"{k+1}/{len(grid)} config")
+    progress.progress((k + 1) / max(1, len(grid)), text=f"{k+1}/{len(grid)} configs")
 progress.empty()
 
 if len(bundle_rows) == 0:
-    st.warning("Nessuna configurazione valida. Controlla range date, IS/OOS e unità.")
+    st.warning("No valid configuration. Check date range, IS/OOS lengths and units.")
     st.stop()
 
 df_bundle = pd.DataFrame(bundle_rows).reset_index(drop=True)
 
 # ============================
-# Parte 3 — Tabs: Bundle, Heatmap, Metriche, Download
+# Tabs: Bundle, Heatmap, Metrics, Download
 # ============================
-
 tab_bundle, tab_heatmap, tab_metrics, tab_downloads = st.tabs(
-    ["Bundle", "Heatmap", "Metriche", "Download"]
+    ["Bundle", "Heatmap", "Metrics", "Download"]
 )
 
 # ----------------------------
-# TAB 1 — Bundle (tutte le linee, statiche, leggere)
+# TAB 1 — Bundle (all lines, static, lightweight)
 # ----------------------------
 with tab_bundle:
-    st.subheader("📈 Bundle OOS concatenati — tutte le configurazioni")
+    st.subheader("📈 Concatenated OOS Bundle — all configurations")
 
     if len(oos_concat_map) == 0:
-        st.info("Nessuna equity da plottare.")
+        st.info("No equity to plot.")
     else:
-        # 1) equity (PnL-like cumulato 0-based) per tutte le configurazioni
+        # cumulative (0-based) for all configurations
         eq_all = {k: oos_concat_map[k].fillna(0.0).cumsum() for k in oos_concat_map.keys()}
         eq_df = pd.DataFrame(eq_all)
         eq_df.index.name = "date"
 
-        # 2) resample + downsample solo per display (non influisce sui calcoli)
-        eq_df = resample_for_display(eq_df, display_freq)
+        # display-only resample/decimate
+        eq_df = resample_for_display(eq_df, display_freq_internal)
         if len(eq_df) > int(max_points):
             eq_df = decimate_by_stride(eq_df, int(max_points))
 
-        # 3) long format; NO legend, NO tooltips, single neutral color via default stroke
+        # long format; NO legend, NO tooltips, single neutral stroke
         plot_df = eq_df.reset_index().melt("date", var_name="config", value_name="equity")
 
         chart = (
             alt.Chart(plot_df)
             .mark_line(strokeWidth=0.7, opacity=0.55, clip=True)
             .encode(
-                x=alt.X("date:T", title="Data"),
-                y=alt.Y("equity:Q", title="PnL cumulato (solo OOS concatenati)", scale=alt.Scale(zero=True)),
-                # Separate series without allocating a big color scale:
-                detail="config:N"
+                x=alt.X("date:T", title="Date"),
+                y=alt.Y("equity:Q", title="Cumulative PnL (concatenated OOS only)", scale=alt.Scale(zero=True)),
+                detail="config:N"   # separate paths without heavy color scale/legend
             )
             .properties(height=420)
         )
@@ -558,19 +575,17 @@ with tab_bundle:
         st.altair_chart(chart, use_container_width=True)
 
 # ----------------------------
-# TAB 2 — Heatmap (IS×OOS) per modalità — static, clean
+# TAB 2 — Heatmap (IS×OOS) by mode — static, clean
 # ----------------------------
 with tab_heatmap:
-    st.subheader("🗺️ Heatmap metrica (IS × OOS)")
+    st.subheader("🗺️ Metric heatmap (IS × OOS)")
 
-    # Preparazione dati heatmap
     hm = df_bundle.copy()
-    # Ricava etichette IS e OOS dal "config" (robusto ai formati "IS=3a | OOS=63g | sliding")
+    # Extract IS/OOS labels from "config"
     try:
         hm["IS"]  = hm["config"].str.extract(r"IS=([^\|]+)\|")[0].str.strip().str.replace("IS=", "", regex=False)
         hm["OOS"] = hm["config"].str.extract(r"OOS=([^\|]+)\|")[0].str.strip().str.replace("OOS=", "", regex=False)
     except Exception:
-        # fallback minimale
         hm["IS"]  = hm.get("is", "").astype(str)
         hm["OOS"] = hm.get("oos", "").astype(str)
 
@@ -582,8 +597,8 @@ with tab_heatmap:
         alt.Chart(hm)
         .mark_rect()
         .encode(
-            x=alt.X("IS:N",  title=f"IS ({is_unit})"),
-            y=alt.Y("OOS:N", title=f"OOS ({oos_unit})"),
+            x=alt.X("IS:N",  title=f"IS ({is_unit_en})"),
+            y=alt.Y("OOS:N", title=f"OOS ({oos_unit_en})"),
             color=alt.Color(f"{metric_col}:Q", title=f"{metric_col}",
                             scale=alt.Scale(scheme="viridis")),
         )
@@ -599,22 +614,22 @@ with tab_heatmap:
     st.altair_chart(ch, use_container_width=True)
 
 # ----------------------------
-# TAB 3 — Metriche (distribuzione)
+# TAB 3 — Metrics distribution
 # ----------------------------
 with tab_metrics:
-    st.subheader("📊 Distribuzione della metrica sul bundle")
+    st.subheader("📊 Metric distribution across the bundle")
 
     metric_col = metric if metric in df_bundle.columns else "Sharpe"
     vals = pd.to_numeric(df_bundle[metric_col], errors="coerce").dropna()
 
     if vals.empty:
-        st.info("Nessun valore disponibile per la metrica selezionata.")
+        st.info("No values available for the selected metric.")
     else:
         p5, p25, p50, p75, p95 = np.percentile(vals, [5, 25, 50, 75, 95])
         c1, c2, c3, c4, c5 = st.columns(5)
         c1.metric("p5", f"{p5:.3f}")
         c2.metric("p25", f"{p25:.3f}")
-        c3.metric("mediana", f"{p50:.3f}")
+        c3.metric("median", f"{p50:.3f}")
         c4.metric("p75", f"{p75:.3f}")
         c5.metric("p95", f"{p95:.3f}")
 
@@ -629,10 +644,10 @@ with tab_metrics:
         )
         st.altair_chart(hist, use_container_width=True)
 
-    st.caption("Suggerimento: una distribuzione stretta e spostata a destra indica robustezza del bundle.")
+    st.caption("A tight distribution shifted to the right suggests a robust bundle.")
 
 # ----------------------------
-# TAB 4 — Download (side-by-side)
+# TAB 4 — Downloads (side-by-side)
 # ----------------------------
 with tab_downloads:
     st.subheader("⬇️ Download")
@@ -640,30 +655,25 @@ with tab_downloads:
     c1, c2 = st.columns(2)
     with c1:
         st.download_button(
-            "Scarica tabella configurazioni (CSV)",
+            "Download configurations table (CSV)",
             data=df_bundle.to_csv(index=False),
             file_name="wfb_bundle_summary.csv",
             mime="text/csv"
         )
 
     with c2:
-        # OOS concatenati in formato largo (colonne = configurazioni)
         out = pd.DataFrame({k: v for k, v in oos_concat_map.items()})
         st.download_button(
-            "Scarica OOS concatenati (tutte le configurazioni, CSV)",
+            "Download concatenated OOS (all configs, CSV)",
             data=out.to_csv(),
             file_name="wfb_oos_concat_all.csv",
             mime="text/csv"
         )
 
-    st.caption("Formato largo: colonne = Configurazioni, righe = timestamp.")
+    st.caption("Wide format: columns = configurations, rows = timestamps.")
 
-# ============================
-# Parte 4 — Rifiniture
-# ============================
-
+# ----------------------------
+# Footer
+# ----------------------------
 st.markdown("---")
 st.caption("© Walk-Forward Bundle Validator — built for clarity & robustness.")
-
-
-
