@@ -7,21 +7,46 @@ import numpy as np
 import altair as alt
 from pathlib import Path
 import json
-import re  # <— AGGIUNGI QUESTA
-
-
+import re  # keep for parsing lists
 
 st.set_page_config(
     page_title="Walk-Forward Bundle Validator",
     layout="wide"
 )
 
-# ----------------------------
-# Helper: equity curve builder
-# ----------------------------
-def equity_curve_from_oos(oos_returns: pd.Series) -> pd.Series:
-    """Cumulative return from OOS series."""
-    return (1 + oos_returns.fillna(0)).cumprod()
+# -------------------------------------------------
+# Altair: light theme, hide toolbar, no interactivity
+# -------------------------------------------------
+# Avoid downsampling surprises on large frames
+alt.data_transformers.disable_max_rows()
+# Hide the Vega toolbar (keeps things clean & static)
+alt.renderers.set_embed_options(actions=False)
+
+def _wfb_theme():
+    return {
+        "config": {
+            "view": {"stroke": "transparent"},
+            "axis": {
+                "labelFontSize": 12,
+                "titleFontSize": 12,
+                "grid": True,
+                "gridOpacity": 0.15
+            },
+            "legend": {"labelFontSize": 11, "titleFontSize": 11}
+        }
+    }
+alt.themes.register("wfb_light", _wfb_theme)
+alt.themes.enable("wfb_light")
+
+# -------------------------------------------------
+# Optional tiny CSS touch (static, very lightweight)
+# -------------------------------------------------
+st.markdown("""
+<style>
+.block-container { padding-top: 1.2rem; }
+footer { visibility: hidden; }
+</style>
+""", unsafe_allow_html=True)
 
 # ----------------------------
 # Helper: mini schema diagram
@@ -68,12 +93,11 @@ L'idea è semplice ma potente:
 - Si provano **più configurazioni** di Walk-Forward (diverse lunghezze IS/OOS, metriche di selezione).
 - Si concatenano i rendimenti **fuori-campione (OOS)** di ciascuna configurazione.
 - Si confrontano le equity line risultanti: se molte configurazioni sono stabili → strategia robusta.
-
-
 """
 )
 #render_walkforward_schema()
 st.divider()
+
 # ============================
 # Parte 2 — Core funzioni + Sidebar + Caricamento + Bundle
 # ============================
@@ -128,7 +152,7 @@ def df_mdd_cols(df: pd.DataFrame) -> pd.Series:
     dd = (eq.cummax() - eq) / eq.cummax()
     return dd.max(axis=0)
 
-# ---- Equity helpers (override to PnL-like cumsum, as per demo style) ----
+# ---- Equity helpers (PnL-like cumsum, as per demo style) ----
 
 def equity_curve_from_oos(oos: pd.Series) -> pd.Series:
     """PnL-like cumulative (starts at 0), robust to gaps."""
@@ -395,7 +419,7 @@ def wf_schematic(start_date, is_unit, oos_unit, is_amt, oos_amt, purge_days=1, s
     df = pd.DataFrame(rows)
     return (
         alt.Chart(df)
-        .mark_bar()
+        .mark_bar(cornerRadius=3)  # subtle rounding, cheap
         .encode(
             x=alt.X("start:T", title="Tempo"),
             x2="end:T",
@@ -409,11 +433,6 @@ def wf_schematic(start_date, is_unit, oos_unit, is_amt, oos_amt, purge_days=1, s
                 ),
                 legend=alt.Legend(title=None, orient="top")
             ),
-            tooltip=[
-                alt.Tooltip("phase:N", title="Fase"),
-                alt.Tooltip("start:T", title="Inizio"),
-                alt.Tooltip("end:T",   title="Fine"),
-            ],
         )
         .properties(height=260)
     )
@@ -478,6 +497,7 @@ if len(bundle_rows) == 0:
     st.stop()
 
 df_bundle = pd.DataFrame(bundle_rows).reset_index(drop=True)
+
 # ============================
 # Parte 3 — Tabs: Bundle, Heatmap, Metriche, Download
 # ============================
@@ -487,10 +507,10 @@ tab_bundle, tab_heatmap, tab_metrics, tab_downloads = st.tabs(
 )
 
 # ----------------------------
-# TAB 1 — Bundle (stile demo)
+# TAB 1 — Bundle (tutte le linee, statiche, leggere)
 # ----------------------------
 with tab_bundle:
-    st.subheader("📈 Bundle OOS concatenati — stile demo")
+    st.subheader("📈 Bundle OOS concatenati — tutte le configurazioni")
 
     if len(oos_concat_map) == 0:
         st.info("Nessuna equity da plottare.")
@@ -505,25 +525,25 @@ with tab_bundle:
         if len(eq_df) > int(max_points):
             eq_df = decimate_by_stride(eq_df, int(max_points))
 
-        # 3) Altair in long format: tutte linee multicolori, spessore costante
+        # 3) long format; NO legend, NO tooltips, single neutral color via default stroke
         plot_df = eq_df.reset_index().melt("date", var_name="config", value_name="equity")
 
         chart = (
             alt.Chart(plot_df)
-            .mark_line(strokeWidth=2)
+            .mark_line(strokeWidth=0.7, opacity=0.55, clip=True)
             .encode(
                 x=alt.X("date:T", title="Data"),
                 y=alt.Y("equity:Q", title="PnL cumulato (solo OOS concatenati)", scale=alt.Scale(zero=True)),
-                color=alt.Color("config:N", legend=None)  # legenda off per performance/leggibilità
+                # Separate series without allocating a big color scale:
+                detail="config:N"
             )
-            .properties(height=480)
-            .interactive()
+            .properties(height=420)
         )
 
         st.altair_chart(chart, use_container_width=True)
 
 # ----------------------------
-# TAB 2 — Heatmap (IS×OOS) per modalità
+# TAB 2 — Heatmap (IS×OOS) per modalità — static, clean
 # ----------------------------
 with tab_heatmap:
     st.subheader("🗺️ Heatmap metrica (IS × OOS)")
@@ -549,13 +569,8 @@ with tab_heatmap:
         .encode(
             x=alt.X("IS:N",  title=f"IS ({is_unit})"),
             y=alt.Y("OOS:N", title=f"OOS ({oos_unit})"),
-            color=alt.Color(f"{metric_col}:Q", title=f"{metric_col}"),
-            tooltip=[
-                alt.Tooltip("config:N", title="Config"),
-                alt.Tooltip(f"{metric_col}:Q", title=metric_col, format=".3f"),
-                alt.Tooltip("splits:Q", title="N° split"),
-                alt.Tooltip("Mode:N",   title="Modalità"),
-            ],
+            color=alt.Color(f"{metric_col}:Q", title=f"{metric_col}",
+                            scale=alt.Scale(scheme="viridis")),
         )
         .properties(height=320)
     )
@@ -590,7 +605,7 @@ with tab_metrics:
 
         hist = (
             alt.Chart(pd.DataFrame({metric_col: vals}))
-            .mark_bar()
+            .mark_bar(opacity=0.9)
             .encode(
                 x=alt.X(f"{metric_col}:Q", bin=alt.Bin(maxbins=45)),
                 y=alt.Y("count()"),
@@ -602,35 +617,35 @@ with tab_metrics:
     st.caption("Suggerimento: una distribuzione stretta e spostata a destra indica robustezza del bundle.")
 
 # ----------------------------
-# TAB 4 — Download
+# TAB 4 — Download (side-by-side)
 # ----------------------------
 with tab_downloads:
     st.subheader("⬇️ Download")
 
-    st.download_button(
-        "Scarica tabella configurazioni (CSV)",
-        data=df_bundle.to_csv(index=False),
-        file_name="wfb_bundle_summary.csv",
-        mime="text/csv"
-    )
+    c1, c2 = st.columns(2)
+    with c1:
+        st.download_button(
+            "Scarica tabella configurazioni (CSV)",
+            data=df_bundle.to_csv(index=False),
+            file_name="wfb_bundle_summary.csv",
+            mime="text/csv"
+        )
 
-    # OOS concatenati in formato largo (colonne = configurazioni)
-    out = pd.DataFrame({k: v for k, v in oos_concat_map.items()})
-    st.download_button(
-        "Scarica OOS concatenati (tutte le configurazioni, CSV)",
-        data=out.to_csv(),
-        file_name="wfb_oos_concat_all.csv",
-        mime="text/csv"
-    )
+    with c2:
+        # OOS concatenati in formato largo (colonne = configurazioni)
+        out = pd.DataFrame({k: v for k, v in oos_concat_map.items()})
+        st.download_button(
+            "Scarica OOS concatenati (tutte le configurazioni, CSV)",
+            data=out.to_csv(),
+            file_name="wfb_oos_concat_all.csv",
+            mime="text/csv"
+        )
 
     st.caption("Formato largo: colonne = Configurazioni, righe = timestamp.")
+
 # ============================
 # Parte 4 — Rifiniture
 # ============================
 
-# Piccolo separatore estetico finale
 st.markdown("---")
 st.caption("© Walk-Forward Bundle Validator — built for clarity & robustness.")
-
-
-
